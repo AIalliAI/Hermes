@@ -57,23 +57,30 @@ def apply_anthropic_cache_control(
     messages, all at the same TTL.
 
     Returns:
-        Deep copy of messages with cache_control breakpoints injected.
+        New message list with cache_control breakpoints injected. Only the
+        (at most 4) marked messages are copied; the rest are shared with the
+        input. This runs on every API call — a full deepcopy would walk
+        every tool result and base64 image in the conversation each time.
     """
-    messages = copy.deepcopy(api_messages)
+    messages = list(api_messages)
     if not messages:
         return messages
 
     marker = _build_marker(cache_ttl)
 
+    def _mark(idx: int) -> None:
+        messages[idx] = copy.deepcopy(messages[idx])
+        _apply_cache_marker(messages[idx], marker, native_anthropic=native_anthropic)
+
     breakpoints_used = 0
 
     if messages[0].get("role") == "system":
-        _apply_cache_marker(messages[0], marker, native_anthropic=native_anthropic)
+        _mark(0)
         breakpoints_used += 1
 
     remaining = 4 - breakpoints_used
     non_sys = [i for i in range(len(messages)) if messages[i].get("role") != "system"]
     for idx in non_sys[-remaining:]:
-        _apply_cache_marker(messages[idx], marker, native_anthropic=native_anthropic)
+        _mark(idx)
 
     return messages

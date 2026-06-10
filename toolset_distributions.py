@@ -7,7 +7,8 @@ Each distribution specifies which toolsets should be used and their probability
 of being selected for any given prompt during the batch processing.
 
 A distribution is a dictionary mapping toolset names to their selection probability (%).
-Probabilities should sum to 100, but the system will normalize if they don't.
+Each toolset is sampled independently with its own percentage probability;
+probabilities do not need to sum to 100 and are not normalized.
 
 Usage:
     from toolset_distributions import get_distribution, list_distributions
@@ -45,11 +46,11 @@ DISTRIBUTIONS = {
     "image_gen": {
         "description": "Heavy focus on image generation with vision and web support",
         "toolsets": {
-            "image_gen": 90,  # 80% chance of image generation tools
-            "vision": 90,      # 60% chance of vision tools
-            "web": 55,         # 40% chance of web tools
+            "image_gen": 90,  # 90% chance of image generation tools
+            "vision": 90,      # 90% chance of vision tools
+            "web": 55,         # 55% chance of web tools
             "terminal": 45,
-            "moa": 10          # 20% chance of reasoning tools
+            "moa": 10          # 10% chance of reasoning tools
         }
     },
     
@@ -194,14 +195,14 @@ DISTRIBUTIONS = {
     
     # Terminal-focused tasks distribution (for nous-terminal-tasks.jsonl)
     "terminal_tasks": {
-        "description": "Terminal-focused distribution with high terminal/file availability, occasional other tools",
+        "description": "Terminal-focused distribution with high terminal/file/web availability, frequent browser, occasional vision/image tools",
         "toolsets": {
             "terminal": 97,   # 97% - terminal almost always available
             "file": 97,       # 97% - file tools almost always available
-            "web": 97,        # 15% - web search/scrape for documentation
-            "browser": 75,    # 10% - browser occasionally for web interaction
-            "vision": 50,      # 8% - vision analysis rarely
-            "image_gen": 10    # 3% - image generation very rarely
+            "web": 97,        # 97% - web search/scrape for documentation
+            "browser": 75,    # 75% - browser for web interaction
+            "vision": 50,      # 50% - vision analysis
+            "image_gen": 10    # 10% - image generation rarely
         }
     },
     

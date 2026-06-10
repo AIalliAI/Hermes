@@ -38,7 +38,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from collections import deque
+from typing import Deque, Dict, List, Optional
 
 logger = logging.getLogger("hermes.mcp_serve")
 
@@ -210,13 +211,15 @@ class EventBridge:
     """
 
     def __init__(self):
-        self._queue: List[QueueEvent] = []
+        # deque(maxlen=...) drops the oldest event on overflow in O(1);
+        # a list's pop(0) is O(n) on every enqueue once full.
+        self._queue: Deque[QueueEvent] = deque(maxlen=QUEUE_LIMIT)
         self._cursor = 0
         self._lock = threading.Lock()
         self._new_event = threading.Event()
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._last_poll_timestamps: Dict[str, float] = {}  # session_key -> unix timestamp
+        self._last_poll_ids: Dict[str, int] = {}  # session_key -> last seen message row id
         # In-memory approval tracking (populated from events)
         self._pending_approvals: Dict[str, dict] = {}
         # mtime cache — skip expensive work when files haven't changed
@@ -323,10 +326,7 @@ class EventBridge:
         with self._lock:
             self._cursor += 1
             event.cursor = self._cursor
-            self._queue.append(event)
-            # Trim queue to limit
-            while len(self._queue) > QUEUE_LIMIT:
-                self._queue.pop(0)
+            self._queue.append(event)  # maxlen evicts the oldest automatically
         self._new_event.set()
 
     def _poll_loop(self):
@@ -356,11 +356,14 @@ class EventBridge:
         except OSError:
             sj_mtime = 0.0
 
-        if sj_mtime != self._sessions_json_mtime:
+        sessions_changed = sj_mtime != self._sessions_json_mtime
+        if sessions_changed:
             self._sessions_json_mtime = sj_mtime
             self._cached_sessions_index = _load_sessions_index()
 
-        # Check if state.db has changed
+        # Check if state.db has changed. SQLite runs in WAL mode, so commits
+        # land in state.db-wal and only touch state.db at checkpoints —
+        # stat both files or new messages go unnoticed until a checkpoint.
         try:
             from hermes_constants import get_hermes_home
             db_file = get_hermes_home() / "state.db"
@@ -369,10 +372,13 @@ class EventBridge:
 
         try:
             db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
+            wal_file = db_file.with_name(db_file.name + "-wal")
+            if wal_file.exists():
+                db_mtime = max(db_mtime, wal_file.stat().st_mtime)
         except OSError:
             db_mtime = 0.0
 
-        if db_mtime == self._state_db_mtime and sj_mtime == self._sessions_json_mtime:
+        if db_mtime == self._state_db_mtime and not sessions_changed:
             return  # Nothing changed since last poll — skip entirely
 
         self._state_db_mtime = db_mtime
@@ -383,43 +389,24 @@ class EventBridge:
             if not session_id:
                 continue
 
-            last_seen = self._last_poll_timestamps.get(session_key, 0.0)
+            # Watermark by row id. Starts at 0, so the first scan of a
+            # session emits its existing messages as events (clients that
+            # connect mid-session receive recent context), and every later
+            # poll fetches only the new tail instead of rehydrating the
+            # whole transcript each 200ms tick.
+            last_id = self._last_poll_ids.get(session_key, 0)
 
             try:
-                messages = db.get_messages(session_id)
+                messages = db.get_messages(session_id, after_id=last_id)
             except Exception:
                 continue
 
             if not messages:
                 continue
 
-            # Normalize timestamps to float for comparison
-            def _ts_float(ts) -> float:
-                if isinstance(ts, (int, float)):
-                    return float(ts)
-                if isinstance(ts, str) and ts:
-                    try:
-                        return float(ts)
-                    except ValueError:
-                        # ISO string — parse to epoch
-                        try:
-                            from datetime import datetime
-                            return datetime.fromisoformat(ts).timestamp()
-                        except Exception:
-                            return 0.0
-                return 0.0
-
-            # Find messages newer than our last seen timestamp
-            new_messages = []
             for msg in messages:
-                ts = _ts_float(msg.get("timestamp", 0))
-                role = msg.get("role", "")
-                if role not in {"user", "assistant"}:
+                if msg.get("role", "") not in {"user", "assistant"}:
                     continue
-                if ts > last_seen:
-                    new_messages.append(msg)
-
-            for msg in new_messages:
                 content = _extract_message_content(msg)
                 if not content:
                     continue
@@ -435,12 +422,9 @@ class EventBridge:
                     },
                 ))
 
-            # Update last seen to the most recent message timestamp
-            all_ts = [_ts_float(m.get("timestamp", 0)) for m in messages]
-            if all_ts:
-                latest = max(all_ts)
-                if latest > last_seen:
-                    self._last_poll_timestamps[session_key] = latest
+            self._last_poll_ids[session_key] = max(
+                last_id, max(int(m.get("id") or 0) for m in messages)
+            )
 
 
 # ---------------------------------------------------------------------------

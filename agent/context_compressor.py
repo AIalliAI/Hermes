@@ -973,7 +973,11 @@ class ContextCompressor(ContextEngine):
         parts = []
         for msg in turns:
             role = msg.get("role", "unknown")
-            content = redact_sensitive_text(msg.get("content") or "")
+            # Multimodal content is a list of parts — extract the text parts
+            # rather than str()-ing the list, which would feed the summarizer
+            # a Python repr dominated by base64 image bytes and usually
+            # truncate away the actual user text.
+            content = redact_sensitive_text(_content_text_for_contains(msg.get("content")))
 
             # Tool results: keep enough content for the summarizer
             if role == "tool":

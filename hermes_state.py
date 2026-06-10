@@ -1360,11 +1360,12 @@ class SessionDB:
         if not session_id:
             return None
         now = time.time()
-        row = self._conn.execute(
-            "SELECT holder FROM compression_locks "
-            "WHERE session_id = ? AND expires_at >= ?",
-            (session_id, now),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT holder FROM compression_locks "
+                "WHERE session_id = ? AND expires_at >= ?",
+                (session_id, now),
+            ).fetchone()
         if row is None:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
@@ -2411,7 +2412,8 @@ class SessionDB:
         self._execute_write(_do)
 
     def get_messages(
-        self, session_id: str, include_inactive: bool = False
+        self, session_id: str, include_inactive: bool = False,
+        after_id: int = 0,
     ) -> List[Dict[str, Any]]:
         """Load messages for a session in insertion order.
 
@@ -2420,15 +2422,21 @@ class SessionDB:
         audit / debug views of rewound history). See
         :meth:`rewind_to_message` for the soft-delete mechanic.
 
+        Pass ``after_id`` to load only rows with a larger id — lets
+        incremental pollers (e.g. the MCP event bridge) fetch the new tail
+        instead of rehydrating the whole transcript every tick.
+
         Ordered by AUTOINCREMENT id (true insertion order) rather than
         timestamp — see c03acca50 for the WSL2 clock-regression rationale.
         """
         active_clause = "" if include_inactive else " AND active = 1"
+        after_clause = " AND id > ?" if after_id else ""
+        params: tuple = (session_id, after_id) if after_id else (session_id,)
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT * FROM messages WHERE session_id = ?"
-                f"{active_clause} ORDER BY id",
-                (session_id,),
+                f"{active_clause}{after_clause} ORDER BY id",
+                params,
             )
             rows = cursor.fetchall()
         result = []
@@ -2473,9 +2481,11 @@ class SessionDB:
         if window < 0:
             window = 0
         with self._lock:
-            # Confirm the anchor exists in this session.
+            # Confirm the anchor exists in this session. Soft-deleted
+            # (rewound) rows are excluded — they're only reachable via
+            # get_messages(include_inactive=True).
             anchor_exists = self._conn.execute(
-                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
+                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? AND active = 1 LIMIT 1",
                 (around_message_id, session_id),
             ).fetchone()
             if not anchor_exists:
@@ -2485,13 +2495,13 @@ class SessionDB:
             # (ASC, take window). Final order is id ASC.
             before_rows = self._conn.execute(
                 "SELECT * FROM messages "
-                "WHERE session_id = ? AND id <= ? "
+                "WHERE session_id = ? AND id <= ? AND active = 1 "
                 "ORDER BY id DESC LIMIT ?",
                 (session_id, around_message_id, window + 1),
             ).fetchall()
             after_rows = self._conn.execute(
                 "SELECT * FROM messages "
-                "WHERE session_id = ? AND id > ? "
+                "WHERE session_id = ? AND id > ? AND active = 1 "
                 "ORDER BY id ASC LIMIT ?",
                 (session_id, around_message_id, window),
             ).fetchall()
@@ -2606,7 +2616,7 @@ class SessionDB:
                 bookend_start_rows = self._conn.execute(
                     f"SELECT * FROM messages "
                     f"WHERE session_id = ? AND id < ?{role_clause} "
-                    f"AND length(content) > 0 "
+                    f"AND length(content) > 0 AND active = 1 "
                     f"ORDER BY id ASC LIMIT ?",
                     (session_id, window_min_id, *role_params, bookend),
                 ).fetchall()
@@ -2614,7 +2624,7 @@ class SessionDB:
                 bookend_end_rows = self._conn.execute(
                     f"SELECT * FROM messages "
                     f"WHERE session_id = ? AND id > ?{role_clause} "
-                    f"AND length(content) > 0 "
+                    f"AND length(content) > 0 AND active = 1 "
                     f"ORDER BY id DESC LIMIT ?",
                     (session_id, window_max_id, *role_params, bookend),
                 ).fetchall()
@@ -2885,29 +2895,23 @@ class SessionDB:
         # Decode content for callers (prefill the prompt buffer).
         target_row["content"] = self._decode_content(target_row.get("content"))
 
-        rewound: List[int] = []
-
         def _do(conn):
+            # Single indexed UPDATE — a SELECT-then-IN-list round trip would
+            # be two passes and break past SQLITE_MAX_VARIABLE_NUMBER on
+            # long sessions.
             cursor = conn.execute(
-                "SELECT id FROM messages "
+                "UPDATE messages SET active = 0 "
                 "WHERE session_id = ? AND id >= ? AND active = 1",
                 (session_id, target_message_id),
             )
-            ids = [r[0] for r in cursor.fetchall()]
-            if ids:
-                placeholders = ",".join("?" for _ in ids)
-                conn.execute(
-                    f"UPDATE messages SET active = 0 WHERE id IN ({placeholders})",
-                    ids,
-                )
             conn.execute(
                 "UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1 "
                 "WHERE id = ?",
                 (session_id,),
             )
-            return ids
+            return cursor.rowcount
 
-        rewound = self._execute_write(_do)
+        rewound_count = self._execute_write(_do)
 
         # 2) Compute new head id (largest still-active row id in session).
         with self._lock:
@@ -2918,7 +2922,7 @@ class SessionDB:
         new_head_id = head_row[0] if head_row and head_row[0] is not None else None
 
         return {
-            "rewound_count": len(rewound),
+            "rewound_count": rewound_count,
             "target_message": target_row,
             "new_head_id": new_head_id,
         }
@@ -2932,18 +2936,11 @@ class SessionDB:
         """
         def _do(conn):
             cursor = conn.execute(
-                "SELECT id FROM messages "
+                "UPDATE messages SET active = 1 "
                 "WHERE session_id = ? AND id >= ? AND active = 0",
                 (session_id, since_message_id),
             )
-            ids = [r[0] for r in cursor.fetchall()]
-            if ids:
-                placeholders = ",".join("?" for _ in ids)
-                conn.execute(
-                    f"UPDATE messages SET active = 1 WHERE id IN ({placeholders})",
-                    ids,
-                )
-            return len(ids)
+            return cursor.rowcount
 
         return self._execute_write(_do)
 
@@ -3339,11 +3336,14 @@ class SessionDB:
 
         # Add surrounding context (1 message before + after each match).
         # Done outside the lock so we don't hold it across N sequential queries.
+        # Neighbors honor the same active filter as the matches themselves so
+        # rewound (soft-deleted) rows don't leak into search context.
+        ctx_active = "" if include_inactive else " AND m.active = 1"
         for match in matches:
             try:
                 with self._lock:
                     ctx_cursor = self._conn.execute(
-                        """WITH target AS (
+                        f"""WITH target AS (
                                SELECT session_id, timestamp, id
                                FROM messages
                                WHERE id = ?
@@ -3353,8 +3353,8 @@ class SessionDB:
                                SELECT m.id, m.timestamp, m.role, m.content
                                FROM messages m
                                JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp < t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id < t.id)
+                               WHERE ((m.timestamp < t.timestamp)
+                                  OR (m.timestamp = t.timestamp AND m.id < t.id)){ctx_active}
                                ORDER BY m.timestamp DESC, m.id DESC
                                LIMIT 1
                            )
@@ -3368,8 +3368,8 @@ class SessionDB:
                                SELECT m.id, m.timestamp, m.role, m.content
                                FROM messages m
                                JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp > t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id > t.id)
+                               WHERE ((m.timestamp > t.timestamp)
+                                  OR (m.timestamp = t.timestamp AND m.id > t.id)){ctx_active}
                                ORDER BY m.timestamp ASC, m.id ASC
                                LIMIT 1
                            )""",
@@ -3520,10 +3520,12 @@ class SessionDB:
 
         if exclude_children:
             # Mirror list_sessions_rich's child-exclusion clause exactly so the
-            # count lines up with the rows: roots (no parent) plus branch
+            # count lines up with the rows: roots (no parent), branch children
+            # carrying the explicit _branched_from marker, and legacy branch
             # children (parent ended with end_reason='branched').
             where_clauses.append(
                 "(s.parent_session_id IS NULL"
+                " OR json_extract(s.model_config, '$._branched_from') IS NOT NULL"
                 " OR EXISTS (SELECT 1 FROM sessions p"
                 "            WHERE p.id = s.parent_session_id"
                 "            AND p.end_reason = 'branched'"
@@ -4537,12 +4539,13 @@ class SessionDB:
         no handoff record.
         """
         try:
-            cur = self._conn.execute(
-                "SELECT handoff_state, handoff_platform, handoff_error "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            )
-            row = cur.fetchone()
+            with self._lock:
+                cur = self._conn.execute(
+                    "SELECT handoff_state, handoff_platform, handoff_error "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                )
+                row = cur.fetchone()
             if not row:
                 return None
             return {
@@ -4559,12 +4562,13 @@ class SessionDB:
         Used by the gateway's handoff watcher.
         """
         try:
-            cur = self._conn.execute(
-                "SELECT * FROM sessions "
-                "WHERE handoff_state = 'pending' "
-                "ORDER BY started_at ASC"
-            )
-            return [dict(r) for r in cur.fetchall()]
+            with self._lock:
+                cur = self._conn.execute(
+                    "SELECT * FROM sessions "
+                    "WHERE handoff_state = 'pending' "
+                    "ORDER BY started_at ASC"
+                )
+                return [dict(r) for r in cur.fetchall()]
         except Exception:
             return []
 

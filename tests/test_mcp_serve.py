@@ -367,7 +367,7 @@ class TestEventBridge:
         from mcp_serve import EventBridge
         b = EventBridge()
         assert b._cursor == 0
-        assert b._queue == []
+        assert list(b._queue) == []
 
     def test_enqueue_and_poll(self):
         from mcp_serve import EventBridge, QueueEvent
@@ -1093,12 +1093,12 @@ class TestEventBridgePollE2E:
 
         # Create a mock SessionDB that reads our test DB
         class TestDB:
-            def get_messages(self, sid):
+            def get_messages(self, sid, after_id=0):
                 conn = sqlite3.connect(str(db_path))
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
-                    "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
-                    (sid,),
+                    "SELECT * FROM messages WHERE session_id = ? AND id > ? ORDER BY id",
+                    (sid, after_id),
                 ).fetchall()
                 conn.close()
                 return [dict(r) for r in rows]
@@ -1144,13 +1144,13 @@ class TestEventBridgePollE2E:
             def __init__(self):
                 self.call_count = 0
 
-            def get_messages(self, sid):
+            def get_messages(self, sid, after_id=0):
                 self.call_count += 1
                 conn = sqlite3.connect(str(db_path))
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
-                    "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
-                    (sid,),
+                    "SELECT * FROM messages WHERE session_id = ? AND id > ? ORDER BY id",
+                    (sid, after_id),
                 ).fetchall()
                 conn.close()
                 return [dict(r) for r in rows]
@@ -1193,12 +1193,12 @@ class TestEventBridgePollE2E:
         ])
 
         class TestDB:
-            def get_messages(self, sid):
+            def get_messages(self, sid, after_id=0):
                 conn = sqlite3.connect(str(db_path))
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
-                    "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
-                    (sid,),
+                    "SELECT * FROM messages WHERE session_id = ? AND id > ? ORDER BY id",
+                    (sid, after_id),
                 ).fetchall()
                 conn.close()
                 return [dict(r) for r in rows]

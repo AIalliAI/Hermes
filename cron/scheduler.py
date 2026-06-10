@@ -1218,6 +1218,9 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "Never combine [SILENT] with content — either report your "
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
+    # Keep the pre-hint body separate: the skills path below quotes it as the
+    # user's instruction, and the hint must not be mislabeled as user text.
+    body = prompt
     prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
@@ -1305,9 +1308,9 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         )
         parts.insert(0, notice)
 
-    if prompt:
-        parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
-    return _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
+    if body:
+        parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {body}"])
+    return _scan_assembled_cron_prompt(cron_hint + "\n".join(parts), job, has_skills=True)
 
 
 def _scan_assembled_cron_prompt(
@@ -1575,14 +1578,19 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
     agent = None
 
-    # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
-    os.environ["HERMES_CRON_SESSION"] = "1"
-
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
     from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+
+    # Mark this context as a cron session so the approval system can apply
+    # cron_mode. A contextvar, NOT os.environ: the gateway runs tick() inside
+    # the same process that serves live chats, and a process-wide env var
+    # would silently switch every subsequent interactive session to cron
+    # approval semantics. Standalone scheduler processes can still export
+    # the env var; tools/approval.py falls back to it when the contextvar
+    # is unset. Reset in the finally below so the flag can't outlive the
+    # job on a reused thread context.
+    _cron_session_token = _VAR_MAP["HERMES_CRON_SESSION"].set("1")
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -2011,6 +2019,10 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         clear_session_vars(_ctx_tokens)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
+        try:
+            _VAR_MAP["HERMES_CRON_SESSION"].reset(_cron_session_token)
+        except (LookupError, ValueError):
+            pass
         if _session_db:
             # Title the cron session from the job (name → short prompt → id) so
             # sidebars/history show a meaningful label instead of the injected
@@ -2146,7 +2158,15 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 # responses: do not deliver a blank message, and let the
                 # empty-response guard below mark the run as a soft failure.
                 should_deliver = bool(deliver_content.strip())
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+                # Match the marker only at the start or end of the response
+                # (agents sometimes disobey "nothing else" and append it
+                # after an explanation) — not anywhere inside it, or a report
+                # that merely *mentions* [SILENT] (quoting logs, explaining
+                # the protocol) would be silently swallowed.
+                _resp_norm = deliver_content.strip().upper()
+                if should_deliver and success and (
+                    _resp_norm.startswith(SILENT_MARKER) or _resp_norm.endswith(SILENT_MARKER)
+                ):
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
 

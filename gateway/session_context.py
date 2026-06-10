@@ -67,6 +67,12 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Marks the current context as a scheduled cron job run. Set per-job in
+# run_job() instead of os.environ so cron jobs executing inside a live
+# gateway process don't flip approval semantics for concurrent interactive
+# sessions (os.environ is process-global and was never cleared).
+_CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_CHAT_ID": _SESSION_CHAT_ID,
@@ -80,6 +86,7 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    "HERMES_CRON_SESSION": _CRON_SESSION,
 }
 
 

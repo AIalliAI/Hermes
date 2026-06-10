@@ -34,7 +34,9 @@ class TestAsyncClientLazyCreation:
         assert comp.async_client is None
 
     def test_get_async_client_creates_new_client(self):
-        """_get_async_client() should create a fresh AsyncOpenAI instance."""
+        """_get_async_client() should create an AsyncOpenAI instance bound
+        to the running loop."""
+        import asyncio
         from trajectory_compressor import TrajectoryCompressor
 
         comp = TrajectoryCompressor.__new__(TrajectoryCompressor)
@@ -43,9 +45,12 @@ class TestAsyncClientLazyCreation:
         comp._async_client_api_key = "test-key"
         comp.async_client = None
 
+        async def _call():
+            return comp._get_async_client()
+
         mock_async_openai = MagicMock()
         with patch("openai.AsyncOpenAI", mock_async_openai):
-            client = comp._get_async_client()
+            asyncio.run(_call())
 
         mock_async_openai.assert_called_once_with(
             api_key="test-key",
@@ -53,9 +58,11 @@ class TestAsyncClientLazyCreation:
         )
         assert comp.async_client is not None
 
-    def test_get_async_client_creates_fresh_each_call(self):
-        """Each call to _get_async_client() creates a NEW client instance,
-        so it binds to the current event loop."""
+    def test_get_async_client_cached_per_loop(self):
+        """Within one event loop the client is cached (no per-request
+        connection-pool leak); a new loop gets a new client so it never
+        binds to a closed loop."""
+        import asyncio
         from trajectory_compressor import TrajectoryCompressor
 
         comp = TrajectoryCompressor.__new__(TrajectoryCompressor)
@@ -74,13 +81,18 @@ class TestAsyncClientLazyCreation:
             instances.append(instance)
             return instance
 
-        with patch("openai.AsyncOpenAI", side_effect=mock_constructor):
-            client1 = comp._get_async_client()
-            client2 = comp._get_async_client()
+        async def _two_calls():
+            return comp._get_async_client(), comp._get_async_client()
 
-        # Should have created two separate instances
-        assert call_count == 2
-        assert instances[0] is not instances[1]
+        with patch("openai.AsyncOpenAI", side_effect=mock_constructor):
+            client1, client2 = asyncio.run(_two_calls())
+            # Same loop → cached, one construction only
+            assert call_count == 1
+            assert client1 is client2
+            # New loop (new asyncio.run) → fresh client
+            asyncio.run(_two_calls())
+            assert call_count == 2
+            assert instances[0] is not instances[1]
 
 
 class TestSourceLineVerification:

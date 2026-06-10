@@ -154,7 +154,10 @@ class CompressionConfig:
             config.base_url = data['summarization'].get('base_url') or config.base_url
             config.api_key_env = data['summarization'].get('api_key_env', config.api_key_env)
             config.temperature = data['summarization'].get('temperature', config.temperature)
-            config.max_retries = data['summarization'].get('max_retries', config.max_retries)
+            # Clamp to >= 1: the retry loops in _generate_summary{,_async}
+            # only return from inside the loop, so 0 would yield None and
+            # corrupt the compressed trajectory.
+            config.max_retries = max(1, data['summarization'].get('max_retries', config.max_retries))
             config.retry_delay = data['summarization'].get('retry_delay', config.retry_delay)
         
         # Output
@@ -425,11 +428,16 @@ class TrajectoryCompressor:
         """
         from openai import AsyncOpenAI
         from agent.auxiliary_client import _to_openai_base_url
-        # Always create a fresh client so it binds to the running loop.
-        self.async_client = AsyncOpenAI(
-            api_key=self._async_client_api_key,
-            base_url=_to_openai_base_url(self.config.base_url),
-        )
+        # Cache one client per event loop: a fresh client per request would
+        # leak its httpx connection pool and defeat connection reuse, while a
+        # single client across asyncio.run() calls would bind to a closed loop.
+        loop = asyncio.get_running_loop()
+        if self.async_client is None or getattr(self, "_async_client_loop", None) is not loop:
+            self.async_client = AsyncOpenAI(
+                api_key=self._async_client_api_key,
+                base_url=_to_openai_base_url(self.config.base_url),
+            )
+            self._async_client_loop = loop
         return self.async_client
 
     def _detect_provider(self) -> str:
@@ -1462,7 +1470,7 @@ def main(
         if sample_percent is not None:
             random.seed(seed)
             sample_size = max(1, int(total_entries * sample_percent / 100))
-            entries = random.sample(entries, sample_size)
+            entries = random.sample(entries, min(sample_size, len(entries)))
             print(f"   Sampled {len(entries):,} trajectories ({sample_percent}% of {total_entries:,})")
         
         if dry_run:

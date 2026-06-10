@@ -183,7 +183,10 @@ def _discover_providers() -> None:
                 continue
             try:
                 importlib.import_module(f"providers.{modname}")
-            except ImportError as exc:
+            except Exception as exc:
+                # Catch everything, not just ImportError: a SyntaxError or a
+                # module-level crash in one legacy file must not abort
+                # discovery of the remaining provider modules.
                 logger.warning(
                     "Failed to import legacy provider module %s: %s", modname, exc
                 )

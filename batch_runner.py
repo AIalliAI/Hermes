@@ -34,6 +34,7 @@ except ModuleNotFoundError:
 import json
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -1010,7 +1011,7 @@ class BatchRunner:
             checkpoint_data["completed_prompts"] = sorted(completed_prompts_set)
             self._save_checkpoint(checkpoint_data, lock=checkpoint_lock)
         except Exception as ckpt_err:
-            print(f"âš ï¸  Warning: Failed to save final checkpoint: {ckpt_err}")
+            print(f"⚠️  Warning: Failed to save final checkpoint: {ckpt_err}")
         
         # Calculate success rates
         for tool_name in total_tool_stats:
@@ -1237,15 +1238,15 @@ def main(
     # Validate required arguments
     if not dataset_file:
         print("❌ Error: --dataset_file is required")
-        return
-    
+        sys.exit(1)
+
     if not batch_size or batch_size < 1:
         print("❌ Error: --batch_size must be a positive integer")
-        return
-    
+        sys.exit(1)
+
     if not run_name:
         print("❌ Error: --run_name is required")
-        return
+        sys.exit(1)
     
     # Parse provider preferences (comma-separated strings to lists)
     providers_allowed_list = [p.strip() for p in providers_allowed.split(",")] if providers_allowed else None
@@ -1313,7 +1314,7 @@ def main(
         print(f"\n❌ Fatal error: {e}")
         if verbose:
             traceback.print_exc()
-        return 1
+        sys.exit(1)
 
 
 if __name__ == "__main__":

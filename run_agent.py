@@ -2341,7 +2341,11 @@ class AIAgent:
             except Exception as e:
                 logger.debug("Failed to propagate interrupt to child agent: %s", e)
         if not self.quiet_mode:
-            print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
+            # _safe_print, not print: interrupt() is called from other
+            # threads (input handler, gateway receiver) where stdout may be
+            # gone in headless environments — a raw print would raise into
+            # the delivering thread.
+            self._safe_print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
 
     def clear_interrupt(self) -> None:
         """Clear any pending interrupt request and the per-thread tool interrupt signal."""

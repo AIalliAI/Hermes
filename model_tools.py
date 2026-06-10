@@ -317,8 +317,11 @@ def get_tool_definitions(
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
         )
-        cached = _tool_defs_cache.get(cache_key)
+        cached = _tool_defs_cache.pop(cache_key, None)
         if cached is not None:
+            # Re-insert so the entry moves to the MRU end — without this the
+            # eviction below is FIFO and can evict the hottest key.
+            _tool_defs_cache[cache_key] = cached
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.
             global _last_resolved_tool_names

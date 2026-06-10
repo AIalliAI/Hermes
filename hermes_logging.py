@@ -499,7 +499,13 @@ def _add_rotating_handler(
             isinstance(existing, RotatingFileHandler)
             and Path(getattr(existing, "baseFilename", "")).resolve() == resolved
         ):
-            return  # already attached
+            # Already attached — refresh its settings so a forced re-setup
+            # (setup_logging(force=True)) can actually change handler level,
+            # rotation size, and backup count.
+            existing.setLevel(level)
+            existing.maxBytes = max_bytes
+            existing.backupCount = backup_count
+            return
 
     path.parent.mkdir(parents=True, exist_ok=True)
     handler = _ManagedRotatingFileHandler(

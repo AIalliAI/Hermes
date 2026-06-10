@@ -2631,10 +2631,13 @@ def run_conversation(
                     except Exception:
                         pass
                     if _genuine_nous_rate_limit:
-                        # Skip straight to max_retries -- the
-                        # top-of-loop guard will handle fallback or
-                        # bail cleanly.
-                        retry_count = max_retries
+                        # Re-enter the loop exactly once so the
+                        # top-of-loop Nous guard handles fallback or
+                        # bails cleanly. (Setting retry_count to
+                        # max_retries would make the while condition
+                        # false immediately and the guard would never
+                        # run -- no fallback, generic exhaustion error.)
+                        retry_count = max(0, max_retries - 1)
                         continue
                     # Upstream capacity 429: fall through to normal
                     # retry logic.  A different model (or the same
@@ -3270,10 +3273,11 @@ def run_conversation(
         if _retry.restart_with_compressed_messages:
             api_call_count -= 1
             agent.iteration_budget.refund()
-            # Count compression restarts toward the retry limit to prevent
-            # infinite loops when compression reduces messages but not enough
-            # to fit the context window.
-            retry_count += 1
+            # Infinite-loop protection for repeated compression restarts is
+            # provided by compression_attempts (checked against
+            # max_compression_attempts in the error handler) — retry_count
+            # is reset at the top of the outer loop, so bumping it here
+            # would be a no-op.
             _retry.restart_with_compressed_messages = False
             continue
 

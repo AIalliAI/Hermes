@@ -477,7 +477,14 @@ Complete the user's task step by step."""
                     break
                 
                 assistant_message = response.choices[0].message
-                
+                # Reasoning models expose thinking via `reasoning` or
+                # `reasoning_content` depending on the provider; keep it so
+                # _convert_to_hermes_format can emit <think> blocks.
+                assistant_reasoning = (
+                    getattr(assistant_message, "reasoning", None)
+                    or getattr(assistant_message, "reasoning_content", None)
+                )
+
                 # Log assistant response
                 if assistant_message.content:
                     print(f"🤖 Assistant: {assistant_message.content[:100]}...")
@@ -490,6 +497,7 @@ Complete the user's task step by step."""
                     messages.append({
                         "role": "assistant",
                         "content": assistant_message.content,
+                        **({"reasoning": assistant_reasoning} if assistant_reasoning else {}),
                         "tool_calls": [
                             {
                                 "id": tc.id,
@@ -549,13 +557,14 @@ Complete the user's task step by step."""
                     final_response = assistant_message.content or ""
                     messages.append({
                         "role": "assistant",
-                        "content": final_response
+                        "content": final_response,
+                        **({"reasoning": assistant_reasoning} if assistant_reasoning else {}),
                     })
                     completed = True
                     print("🎉 Agent finished (no more tool calls)")
                     break
             
-            if api_call_count >= self.max_iterations:
+            if not completed and api_call_count >= self.max_iterations:
                 print(f"⚠️  Reached max iterations ({self.max_iterations})")
         
         finally:
@@ -637,7 +646,7 @@ def main(
     task: str = None,
     prompts_file: str = None,
     output_file: str = "swe-runner-test1.jsonl",
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "anthropic/claude-sonnet-4.6",
     base_url: str = None,
     api_key: str = None,
     env: str = "local",
@@ -654,7 +663,7 @@ def main(
         task: Single task to run (use this OR prompts_file)
         prompts_file: JSONL file with prompts (each line: {"prompt": "..."})
         output_file: Output JSONL file for trajectories
-        model: Model name (default: claude-sonnet-4-20250514)
+        model: Model name (default: anthropic/claude-sonnet-4.6)
         base_url: API base URL (optional)
         api_key: API key (optional, uses env vars)
         env: Environment type - "local", "docker", or "modal"
