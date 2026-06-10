@@ -1651,6 +1651,8 @@ export const zh: Translations = {
       branch: branch => `分支 ${branch}`,
       closeCommandCenter: '关闭命令中心',
       openCommandCenter: '打开命令中心',
+      showTerminal: '显示终端',
+      hideTerminal: '隐藏终端',
       gateway: '网关',
       gatewayReady: '就绪',
       gatewayNeedsSetup: '需要设置',

@@ -1565,6 +1565,8 @@ export const zhHant = defineLocale({
       branch: branch => `分支 ${branch}`,
       closeCommandCenter: '關閉命令中心',
       openCommandCenter: '開啟命令中心',
+      showTerminal: '顯示終端機',
+      hideTerminal: '隱藏終端機',
       gateway: '閘道',
       gatewayReady: '就緒',
       gatewayNeedsSetup: '需要設定',
