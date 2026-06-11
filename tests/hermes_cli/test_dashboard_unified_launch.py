@@ -115,6 +115,37 @@ class TestUnifiedDashboardRouting:
             main_mod.cmd_dashboard(_args())
         assert listening_calls == []
 
+    def test_windows_profile_launch_serves_in_place(self, main_mod, monkeypatch, capsys):
+        """On Windows the CRT emulates execve as spawn+terminate, which makes
+        the desktop's PID-tracked pool backend look like an instant crash
+        (#44309). The routing must serve the profile in-place instead."""
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "auditor"
+        )
+        monkeypatch.setattr(main_mod, "_dashboard_listening", lambda host, port: False)
+        monkeypatch.setattr(main_mod.os, "name", "nt")
+        execs = []
+        monkeypatch.setattr(main_mod.os, "execvpe", lambda *a, **k: execs.append(a))
+        monkeypatch.setitem(sys.modules, "fastapi", None)
+
+        with pytest.raises((SystemExit, AttributeError, ImportError, TypeError)):
+            main_mod.cmd_dashboard(_args())
+        assert execs == []  # never re-exec'd; fell through to serve in-place
+        assert "dedicated dashboard for profile 'auditor'" in capsys.readouterr().out
+
+    def test_windows_profile_launch_still_attaches(self, main_mod, monkeypatch):
+        """The attach leg involves no exec, so Windows keeps it: a running
+        machine dashboard is reused instead of starting a per-profile one."""
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "auditor"
+        )
+        monkeypatch.setattr(main_mod, "_dashboard_listening", lambda host, port: True)
+        monkeypatch.setattr(main_mod.os, "name", "nt")
+
+        with pytest.raises(SystemExit) as exc:
+            main_mod.cmd_dashboard(_args())
+        assert exc.value.code == 0
+
     def test_reexec_child_does_not_reroute(self, main_mod, monkeypatch):
         """The re-exec'd child carries --open-profile; the guard must treat
         that as 'already routed' and never re-exec again (no exec loop)."""

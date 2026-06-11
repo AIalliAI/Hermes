@@ -10317,6 +10317,7 @@ def cmd_dashboard(args):
     #     the sticky active_profile file) with the launching profile
     #     preselected in the UI's switcher.
     # `--isolated` opts out and preserves the old per-profile behavior.
+    # Windows skips the re-exec leg and serves in-place (no real execve there).
     try:
         from hermes_cli.profiles import get_active_profile_name
         _launch_profile = get_active_profile_name()
@@ -10340,28 +10341,39 @@ def cmd_dashboard(args):
                     pass
             sys.exit(0)
 
-        print(
-            f"Routing to the machine dashboard (profile '{_launch_profile}' "
-            f"preselected). Use --isolated for a dedicated per-profile server."
-        )
-        reexec_argv = [
-            sys.executable, "-m", "hermes_cli.main",
-            "-p", "default",
-            "dashboard",
-            "--port", str(args.port),
-            "--host", args.host,
-            "--open-profile", _launch_profile,
-        ]
-        if args.no_open:
-            reexec_argv.append("--no-open")
-        if getattr(args, "insecure", False):
-            reexec_argv.append("--insecure")
-        if getattr(args, "skip_build", False):
-            reexec_argv.append("--skip-build")
-        env = os.environ.copy()
-        # Drop the profile HERMES_HOME so the child binds the machine root.
-        env.pop("HERMES_HOME", None)
-        os.execvpe(sys.executable, reexec_argv, env)
+        if os.name == "nt":
+            # Windows has no real execve: the CRT emulates it as spawn-new +
+            # terminate-current, so whoever spawned this process — notably the
+            # desktop app's backend pool, which tracks this exact PID — sees
+            # an immediate crash and reaps the backend (#44309). Serve the
+            # profile in-place instead (same behavior as --isolated).
+            print(
+                f"Serving a dedicated dashboard for profile '{_launch_profile}' "
+                f"(Windows cannot re-exec into the machine dashboard)."
+            )
+        else:
+            print(
+                f"Routing to the machine dashboard (profile '{_launch_profile}' "
+                f"preselected). Use --isolated for a dedicated per-profile server."
+            )
+            reexec_argv = [
+                sys.executable, "-m", "hermes_cli.main",
+                "-p", "default",
+                "dashboard",
+                "--port", str(args.port),
+                "--host", args.host,
+                "--open-profile", _launch_profile,
+            ]
+            if args.no_open:
+                reexec_argv.append("--no-open")
+            if getattr(args, "insecure", False):
+                reexec_argv.append("--insecure")
+            if getattr(args, "skip_build", False):
+                reexec_argv.append("--skip-build")
+            env = os.environ.copy()
+            # Drop the profile HERMES_HOME so the child binds the machine root.
+            env.pop("HERMES_HOME", None)
+            os.execvpe(sys.executable, reexec_argv, env)
 
     # Attach gui.log early so dashboard startup/build failures are captured in
     # the same logs directory as every other Hermes surface.
