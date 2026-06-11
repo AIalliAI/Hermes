@@ -110,6 +110,7 @@ def test_ensure_docker_available_uses_resolved_executable(monkeypatch):
             "text": True,
             "timeout": 5,
             "stdin": subprocess.DEVNULL,
+            "creationflags": docker_env.windows_hide_flags(),
         })
     ]
 
