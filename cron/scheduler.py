@@ -190,10 +190,11 @@ def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadP
 def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
     """Return (or create) the persistent single-thread sequential pool.
 
-    A single worker guarantees env/context-mutating jobs never overlap, even
-    across ticks: a job queued by a newer tick waits for the previous tick's
-    sequential jobs to finish rather than corrupting their os.environ /
-    profile state.
+    A single worker guarantees env/context-mutating jobs never overlap each
+    other, even across ticks: a job queued by a newer tick waits for the
+    previous tick's sequential jobs to finish rather than corrupting their
+    os.environ / profile state.  Exclusion against the PARALLEL pool is not
+    this pool's job — that is _env_gate, acquired inside the worker.
     """
     global _sequential_pool
     if _sequential_pool is None:
@@ -202,6 +203,66 @@ def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
             thread_name_prefix="cron-seq",
         )
     return _sequential_pool
+
+
+class _EnvMutationGate:
+    """Reader-writer gate isolating env-mutating cron jobs from parallel ones.
+
+    The single-thread sequential pool serializes workdir/profile jobs against
+    EACH OTHER, but says nothing about the parallel pool: a workdir job
+    mutating os.environ["TERMINAL_CWD"], or a profile job swapping the Hermes
+    home override and restoring an os.environ snapshot, must not overlap a
+    parallel job that reads that same process-global state mid-run (.env
+    loading, config.yaml resolution, terminal/file tool cwd).
+
+    Parallel jobs hold the gate in shared mode for their entire run; workdir/
+    profile jobs hold it exclusively. Acquisition happens inside the worker
+    threads, so tick() dispatch stays fire-and-forget and the ticker thread
+    never blocks. Exclusive acquisition has priority: once an env-mutating job
+    is waiting, new parallel jobs queue behind it rather than starving it.
+    The cost is that a due workdir/profile job stalls behind in-flight
+    parallel jobs (and holds back new ones) until they drain — correctness
+    over throughput.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._shared_count = 0
+        self._exclusive_held = False
+        self._exclusive_waiting = 0
+
+    @contextmanager
+    def shared(self):
+        with self._cond:
+            while self._exclusive_held or self._exclusive_waiting:
+                self._cond.wait()
+            self._shared_count += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._shared_count -= 1
+                self._cond.notify_all()
+
+    @contextmanager
+    def exclusive(self):
+        with self._cond:
+            self._exclusive_waiting += 1
+            try:
+                while self._exclusive_held or self._shared_count:
+                    self._cond.wait()
+            finally:
+                self._exclusive_waiting -= 1
+            self._exclusive_held = True
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._exclusive_held = False
+                self._cond.notify_all()
+
+
+_env_gate = _EnvMutationGate()
 
 
 def _shutdown_parallel_pool() -> None:
@@ -235,6 +296,34 @@ def _get_lock_paths() -> tuple[Path, Path]:
     return lock_dir, lock_dir / ".tick.lock"
 
 
+def _gateway_scheduler_owner_active() -> bool:
+    """Return True when a gateway process owns the scheduler for this profile.
+
+    The gateway runtime lock is per-HERMES_HOME (i.e. per profile), held for
+    the live gateway's lifetime and released by the OS if that process dies, so
+    a stale lock never lingers. When it is held, the launchd/systemd-managed
+    gateway is the authoritative scheduler owner for the profile.
+
+    This is the ownership signal the ``.tick.lock`` does not provide: the tick
+    lock only gives at-most-once execution, but says nothing about *which*
+    process runs the job. On macOS that distinction is part of the security
+    model — TCC / Full Disk Access provenance depends on the executing process
+    ancestry — so a non-authoritative ticker (e.g. a Desktop dashboard backend)
+    must defer to the gateway rather than run jobs from the wrong ancestry.
+    """
+    try:
+        from gateway.status import is_gateway_runtime_lock_active
+        return is_gateway_runtime_lock_active()
+    except Exception:
+        # If the ownership signal is unavailable, fail open: behave as before
+        # (no owner detected) rather than blocking the only available ticker.
+        logger.debug(
+            "gateway scheduler-owner check failed; assuming no owner",
+            exc_info=True,
+        )
+        return False
+
+
 @contextmanager
 def _job_profile_context(job_id: str, profile: Optional[str]):
     """Temporarily run a job under a specific Hermes profile.
@@ -248,8 +337,9 @@ def _job_profile_context(job_id: str, profile: Optional[str]):
 
     Some existing provider/config paths still load profile .env values through
     os.environ, so profile jobs also snapshot and restore the process
-    environment on exit. tick() runs profile jobs sequentially to keep that
-    temporary mutation isolated from other scheduled jobs.
+    environment on exit. tick() runs profile jobs under the exclusive side of
+    _env_gate (and a single-thread pool) to keep that temporary mutation
+    isolated from ALL other scheduled jobs, including parallel-pool ones.
     """
     raw_profile = str(profile or "").strip()
     if not raw_profile:
@@ -1632,9 +1722,11 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     #     .cursorrules from the job's project dir, AND
     #   - the terminal, file, and code-exec tools run commands from there.
     #
-    # tick() serializes jobs that mutate process-global runtime state (workdir
-    # and/or profile jobs) outside the parallel pool, so mutating
-    # os.environ["TERMINAL_CWD"] here is safe for those jobs. For workdir-less
+    # tick() runs jobs that mutate process-global runtime state (workdir
+    # and/or profile jobs) under the exclusive side of _env_gate: serialized
+    # among themselves by the single-thread sequential pool AND excluded from
+    # overlapping any parallel-pool job that reads this state mid-run. That
+    # makes mutating os.environ["TERMINAL_CWD"] here safe. For workdir-less
     # jobs we leave TERMINAL_CWD untouched — preserves the original behaviour
     # (skip_context_files=True, tools use whatever cwd the scheduler has).
     _job_workdir = (job.get("workdir") or "").strip() or None
@@ -2064,21 +2156,44 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> int:
+def tick(
+    verbose: bool = True,
+    adapters=None,
+    loop=None,
+    sync: bool = True,
+    *,
+    defer_to_gateway_owner: bool = False,
+) -> int:
     """
     Check and run all due jobs.
-    
+
     Uses a file lock so only one tick runs at a time, even if the gateway's
     in-process ticker and a standalone daemon or manual tick overlap.
-    
+
     Args:
         verbose: Whether to print status messages
         adapters: Optional dict mapping Platform → live adapter (from gateway)
         loop: Optional asyncio event loop (from gateway) for live adapter sends
-    
+        defer_to_gateway_owner: When True, skip execution entirely if a gateway
+            already owns the scheduler for this profile. Non-authoritative
+            tickers (e.g. the Desktop dashboard backend) pass True so that jobs
+            only ever execute from the authorised gateway process ancestry —
+            the ``.tick.lock`` alone gives at-most-once execution but not
+            deterministic provenance, which macOS TCC / Full Disk Access
+            requires. The gateway's own ticker leaves this False so it always
+            runs.
+
     Returns:
-        Number of jobs executed (0 if another tick is already running)
+        Number of jobs executed (0 if another tick is already running, or if
+        deferring to the gateway scheduler owner)
     """
+    if defer_to_gateway_owner and _gateway_scheduler_owner_active():
+        logger.info(
+            "Cron tick skipped — a gateway owns the scheduler for this profile; "
+            "deferring execution to preserve job provenance"
+        )
+        return 0
+
     lock_dir, lock_file = _get_lock_paths()
     lock_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2197,9 +2312,12 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         # process-global runtime state inside run_job. Workdir jobs temporarily
         # set os.environ["TERMINAL_CWD"]; profile jobs use a context-local
         # Hermes home override, scheduler _hermes_home hook, and temporary
-        # profile .env load into os.environ with snapshot/restore. They MUST run
-        # sequentially to avoid corrupting each other. Jobs without either field
-        # stay parallel-safe.
+        # profile .env load into os.environ with snapshot/restore. They MUST
+        # run one at a time (single-thread pool) AND must not overlap parallel
+        # jobs, which read that same state mid-run (_get_hermes_home() for
+        # .env/config/script resolution, TERMINAL_CWD in terminal/file tools)
+        # — _env_gate enforces the cross-pool exclusion. Jobs without either
+        # field stay parallel-safe.
         sequential_jobs = [
             j for j in due_jobs
             if (j.get("workdir") or "").strip() or (j.get("profile") or "").strip()
@@ -2212,12 +2330,21 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         _results: list = []
         _all_futures: list = []
 
-        def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor):
+        def _submit_with_guard(
+            job: dict,
+            pool: concurrent.futures.ThreadPoolExecutor,
+            exclusive: bool = False,
+        ):
             """Submit a job fire-and-forget with the in-flight dedup guard.
 
             Returns the future, or None if the job was skipped because a prior
             tick's run of the same job is still in flight.  The running-set
             membership is released in the worker's finally block.
+
+            ``exclusive=True`` runs the job under the env-mutation gate's
+            exclusive side (workdir/profile jobs); the default shared side is
+            for parallel jobs.  The gate is acquired in the worker thread, so
+            dispatch never blocks the ticker.
             """
             job_id = job["id"]
             with _running_lock:
@@ -2226,10 +2353,12 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     return None
                 _running_job_ids.add(job_id)
             _ctx = contextvars.copy_context()
+            _gate = _env_gate.exclusive if exclusive else _env_gate.shared
 
-            def _run_and_release(j=job, ctx=_ctx):
+            def _run_and_release(j=job, ctx=_ctx, gate=_gate):
                 try:
-                    return ctx.run(_process_job, j)
+                    with gate():
+                        return ctx.run(_process_job, j)
                 finally:
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
@@ -2241,11 +2370,13 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         # WITHOUT blocking the ticker thread — a long workdir/profile job no
         # longer starves the rest of the schedule (same fix as the parallel
         # pass, just serialized).  The in-flight guard prevents a still-running
-        # job from being re-queued on the next tick.
+        # job from being re-queued on the next tick.  exclusive=True takes the
+        # env-mutation gate's writer side so these jobs also never overlap
+        # in-flight parallel jobs reading the same process-global state.
         if sequential_jobs:
             seq_pool = _get_sequential_pool()
             for job in sequential_jobs:
-                fut = _submit_with_guard(job, seq_pool)
+                fut = _submit_with_guard(job, seq_pool, exclusive=True)
                 if fut is None:
                     continue
                 _all_futures.append(fut)
