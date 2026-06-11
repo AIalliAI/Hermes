@@ -1280,6 +1280,12 @@ def _managed_files_policy(request: Request, *, create_root: bool = True) -> Mana
         return ManagedFilesPolicy(default_path=root, locked_root=root, can_change_path=False)
 
     home = _canonical_path(Path.home())
+    if not _local_dashboard_request(request):
+        # Remote / auth-gated clients on a host install stay confined to the
+        # dashboard user's home. /opt/data only exists in the hosted (Docker)
+        # filesystem layout, which is detected via HERMES_HOME above — forcing
+        # it here 500s on plain host installs reached over the LAN (#44116).
+        return ManagedFilesPolicy(default_path=home, locked_root=home, can_change_path=False)
     return ManagedFilesPolicy(default_path=home, locked_root=None, can_change_path=True)
 
 
