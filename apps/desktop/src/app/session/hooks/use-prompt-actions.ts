@@ -211,7 +211,12 @@ function friendlyRemoteAttachError(err: unknown, label: string): Error {
   return new Error(`${label} is too large to upload to the remote gateway${cap}.`)
 }
 
-type GatewayRequest = <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+type GatewayRequest = <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
+
+// Manual compression is LLM-bound and routinely outlives the desktop's 30s
+// default WS request timeout on large sessions — give it the TUI client's
+// 120s RPC budget (HERMES_TUI_RPC_TIMEOUT_MS default) instead.
+const SESSION_COMPRESS_TIMEOUT_MS = 120_000
 
 /**
  * Stage one file/image attachment into the session workspace and return the
@@ -314,7 +319,7 @@ interface PromptActionsOptions {
   createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
   handleSkinCommand: (arg: string) => string
   refreshSessions: () => Promise<void>
-  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  requestGateway: GatewayRequest
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   startFreshSessionDraft: () => void
@@ -1054,10 +1059,14 @@ export function usePromptActions({
           const focusTopic = ctx.arg.trim()
 
           try {
-            const result = await requestGateway<SessionCompressResponse>('session.compress', {
-              session_id: sessionId,
-              ...(focusTopic ? { focus_topic: focusTopic } : {})
-            })
+            const result = await requestGateway<SessionCompressResponse>(
+              'session.compress',
+              {
+                session_id: sessionId,
+                ...(focusTopic ? { focus_topic: focusTopic } : {})
+              },
+              SESSION_COMPRESS_TIMEOUT_MS
+            )
 
             const summary = result?.summary
 

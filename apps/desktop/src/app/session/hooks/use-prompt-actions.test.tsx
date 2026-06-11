@@ -317,8 +317,13 @@ describe('usePromptActions /compress', () => {
     await handle!.submitText('/compress')
 
     // The dedicated RPC is the TUI's path and has no slash-worker pipe
-    // timeout — a large session's compression must not race a 45s cap.
-    expect(requestGateway).toHaveBeenCalledWith('session.compress', { session_id: RUNTIME_SESSION_ID })
+    // timeout — and the call carries an LLM-sized client timeout instead of
+    // the 30s WS default, so a large session's compression can finish.
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.compress',
+      { session_id: RUNTIME_SESSION_ID },
+      120_000
+    )
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
     expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
 
@@ -334,10 +339,14 @@ describe('usePromptActions /compress', () => {
 
     await handle!.submitText('/compress the auth refactor')
 
-    expect(requestGateway).toHaveBeenCalledWith('session.compress', {
-      focus_topic: 'the auth refactor',
-      session_id: RUNTIME_SESSION_ID
-    })
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.compress',
+      {
+        focus_topic: 'the auth refactor',
+        session_id: RUNTIME_SESSION_ID
+      },
+      120_000
+    )
   })
 
   it('surfaces the RPC error verbatim (e.g. the busy guard) instead of a routing error', async () => {
