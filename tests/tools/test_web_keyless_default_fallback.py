@@ -75,6 +75,62 @@ def test_fallback_honors_explicit_disable(monkeypatch):
     assert "tavily" in names
 
 
+def test_no_resweep_when_parallel_explicitly_disabled(monkeypatch):
+    """An explicit web-parallel disable must not re-trigger the sweep per call.
+
+    With ``plugins.disabled: [web-parallel]``, ``get_provider('parallel')``
+    stays ``None`` forever by design. That must read as "intentionally off",
+    not "failed sweep" — otherwise every web_search/web_extract call re-pays
+    the bundled-dir sweep and overwrites live registry entries with fresh
+    bundled instances.
+    """
+    monkeypatch.setattr(plugins, "_get_disabled_plugins", lambda: {"web-parallel"})
+    monkeypatch.setattr(plugins, "_ensure_plugins_discovered", lambda *a, **k: None)
+
+    # Healthy discovery left the registry populated — minus the disabled backend.
+    import importlib
+
+    class _Ctx:
+        def register_web_search_provider(self, provider):
+            reg.register_provider(provider)
+
+    importlib.import_module("plugins.web.tavily").register(_Ctx())
+    before = reg.get_provider("tavily")
+
+    calls = {"n": 0}
+    real = web_tools._register_bundled_web_providers_directly
+
+    def _spy():
+        calls["n"] += 1
+        real()
+
+    monkeypatch.setattr(web_tools, "_register_bundled_web_providers_directly", _spy)
+    web_tools._ensure_web_plugins_loaded()
+    web_tools._ensure_web_plugins_loaded()
+
+    assert calls["n"] == 0, "explicit disable re-triggered the fallback sweep"
+    assert reg.get_provider("parallel") is None
+    # Live registry entries were not replaced by fresh bundled instances.
+    assert reg.get_provider("tavily") is before
+
+
+def test_empty_registry_still_sweeps_when_parallel_disabled(monkeypatch):
+    """A failed sweep registers nothing — emptiness must still trigger recovery.
+
+    Even with web-parallel disabled, an empty registry means the sweep failed,
+    and the other bundled backends must be restored (parallel stays off).
+    """
+    monkeypatch.setattr(plugins, "_get_disabled_plugins", lambda: {"web-parallel"})
+    monkeypatch.setattr(plugins, "_ensure_plugins_discovered", _boom)
+    assert not reg.list_providers()
+
+    web_tools._ensure_web_plugins_loaded()
+
+    names = {p.name for p in reg.list_providers()}
+    assert "parallel" not in names, "explicit disable was ignored"
+    assert "tavily" in names, "failed-sweep recovery skipped with parallel disabled"
+
+
 def test_fallback_is_noop_when_discovery_already_registered(monkeypatch):
     """Healthy path: don't pay for the direct sweep when parallel is present."""
     # Pretend the general sweep already registered the keyless default.
