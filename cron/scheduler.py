@@ -210,9 +210,9 @@ class _EnvMutationGate:
 
     The single-thread sequential pool serializes workdir jobs against
     EACH OTHER, but says nothing about the parallel pool: a workdir job
-    mutating os.environ["TERMINAL_CWD"] must not overlap a
-    parallel job that reads that same process-global state mid-run (.env
-    loading, config.yaml resolution, terminal/file tool cwd).
+    mutating os.environ["TERMINAL_CWD"] must not overlap a parallel job
+    that reads that same process-global state mid-run (.env loading,
+    config.yaml resolution, terminal/file tool cwd).
 
     Parallel jobs hold the gate in shared mode for their entire run; workdir
     jobs hold it exclusively. Acquisition happens inside the worker
@@ -2222,13 +2222,13 @@ def tick(
                 mark_job_run(job["id"], False, str(e))
                 return False
 
-        # Partition due jobs: jobs with a per-job workdir touch process-global
-        # runtime state inside run_job by temporarily setting
-        # os.environ["TERMINAL_CWD"]. They MUST run one at a time
-        # (single-thread pool) AND must not overlap parallel jobs, which read
-        # that same state mid-run (TERMINAL_CWD in terminal/file tools) —
-        # _env_gate enforces the cross-pool exclusion. Jobs without a workdir
-        # stay parallel-safe.
+        # Partition due jobs: jobs with a per-job workdir mutate process-global
+        # runtime state inside run_job (os.environ["TERMINAL_CWD"]). They MUST
+        # run one at a time (single-thread pool) AND must not overlap parallel
+        # jobs, which read that same state mid-run (_get_hermes_home() for
+        # .env/config/script resolution, TERMINAL_CWD in terminal/file tools)
+        # — _env_gate enforces the cross-pool exclusion. Jobs without a
+        # workdir stay parallel-safe.
         sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
         parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
 
