@@ -1466,6 +1466,13 @@ class AIAgent:
         history. When an override is configured for the active turn, mutate the
         in-memory messages list in place so both persistence and returned
         history stay clean.
+
+        Multimodal turns (OpenAI-style content-part lists) are left untouched:
+        the turn-start crash-resilience persist runs before the first API call
+        on the same list the request is built from, so replacing the list with
+        the text-only override would strip image parts before they ever reach
+        the model (#44242). Image redaction for the session DB happens in
+        ``_flush_messages_to_session_db`` instead.
         """
         idx = getattr(self, "_persist_user_message_idx", None)
         override = getattr(self, "_persist_user_message_override", None)
@@ -1474,6 +1481,8 @@ class AIAgent:
         if 0 <= idx < len(messages):
             msg = messages[idx]
             if isinstance(msg, dict) and msg.get("role") == "user":
+                if isinstance(msg.get("content"), list):
+                    return
                 msg["content"] = override
 
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
