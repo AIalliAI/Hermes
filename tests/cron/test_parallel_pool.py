@@ -407,7 +407,7 @@ class TestEnvMutationGate:
             sched._running_job_ids.clear()
 
     def test_parallel_job_waits_for_inflight_sequential_job(self, tmp_path, monkeypatch):
-        """A parallel job dispatched while a workdir/profile job runs must not
+        """A parallel job dispatched while a workdir job runs must not
         start (and read mutated env state) until the sequential job finishes."""
         import cron.scheduler as sched
 
