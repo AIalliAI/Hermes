@@ -163,6 +163,79 @@ def test_spotify_interactive_setup_persists_client_id(
     assert auth_mod.SPOTIFY_DOCS_URL in output
 
 
+def _run_manual_paste_login(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    pasted: str,
+) -> dict:
+    """Drive login_spotify_command with --manual-paste and a fake pasted value.
+
+    Returns the kwargs passed to the token exchange (empty if never reached).
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(auth_mod, "_is_remote_session", lambda: True)
+    monkeypatch.setattr(auth_mod, "webbrowser", SimpleNamespace(open=lambda *_a, **_k: False))
+    monkeypatch.setattr("builtins.input", lambda prompt="": pasted)
+
+    exchanged: dict = {}
+
+    def fake_exchange(**kwargs):
+        exchanged.update(kwargs)
+        return {
+            "access_token": "fresh-access",
+            "refresh_token": "fresh-refresh",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scope": auth_mod.DEFAULT_SPOTIFY_SCOPE,
+        }
+
+    monkeypatch.setattr(auth_mod, "_spotify_exchange_code_for_tokens", fake_exchange)
+
+    auth_mod.login_spotify_command(
+        SimpleNamespace(
+            client_id="test-client",
+            redirect_uri=None,
+            scope=None,
+            no_browser=True,
+            manual_paste=True,
+            timeout=None,
+        )
+    )
+    return exchanged
+
+
+def test_manual_paste_bare_code_reaches_token_exchange(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    """A bare authorization code (no state) must not be rejected as a state
+    mismatch — the paste prompt explicitly tells users a bare code works,
+    and PKCE still binds the exchange."""
+    exchanged = _run_manual_paste_login(monkeypatch, tmp_path, "AQDtR3-bare-code")
+
+    assert exchanged.get("code") == "AQDtR3-bare-code"
+    assert "Spotify login successful!" in capsys.readouterr().out
+    persisted = auth_mod.get_provider_auth_state("spotify")
+    assert persisted is not None
+    assert persisted["access_token"] == "fresh-access"
+
+
+def test_manual_paste_wrong_state_still_rejected(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tolerating a *missing* state must not loosen validation of a *present*
+    one: a pasted URL whose state differs from the local nonce still aborts
+    before the token exchange."""
+    with pytest.raises(SystemExit, match="state mismatch"):
+        _run_manual_paste_login(
+            monkeypatch,
+            tmp_path,
+            "http://127.0.0.1:43827/spotify/callback?code=abc&state=not-the-nonce",
+        )
+
+
 def test_spotify_interactive_setup_empty_aborts(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
