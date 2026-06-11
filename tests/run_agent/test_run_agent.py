@@ -6179,6 +6179,36 @@ class TestPersistUserMessageOverride:
         first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
         assert first_db_write["content"] == "Hello there"
 
+    def test_override_leaves_multimodal_content_intact(self, agent):
+        """Multimodal user turns must keep their image parts (#44242).
+
+        The turn-start crash-resilience persist runs before the first API
+        call on the same list the request is built from — clobbering the
+        content-part list with the text-only override would drop the image
+        end-to-end.
+        """
+        agent._session_db = MagicMock()
+        agent.session_id = "session-123"
+        agent._last_flushed_db_idx = 0
+        agent._persist_user_message_idx = 0
+        agent._persist_user_message_override = "What color is this?"
+        multimodal_content = [
+            {"type": "text", "text": "What color is this?"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,AAAA"},
+            },
+        ]
+        messages = [{"role": "user", "content": multimodal_content}]
+
+        agent._persist_session(messages, [])
+
+        # API-bound message keeps the image part.
+        assert messages[0]["content"] == multimodal_content
+        # DB persistence still redacts the image to a text placeholder.
+        first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
+        assert first_db_write["content"] == "What color is this?\n[screenshot]"
+
 
 class TestReasoningReplayForStrictProviders:
     """Assistant replay must preserve provider-native reasoning fields."""
