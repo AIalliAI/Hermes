@@ -112,9 +112,14 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     a user creates in the app would never fire. We run a minimal ticker here
     (no live adapters; delivery falls back to the per-platform send path).
 
-    Cross-process safe: ``cron.scheduler.tick`` takes the ``cron/.tick.lock``
-    file lock, so this never double-fires alongside a real gateway on the same
-    HERMES_HOME — whichever process grabs the lock first wins the tick.
+    Defers to the gateway: ``cron/.tick.lock`` only gives at-most-once
+    execution — whichever process grabs it first runs the tick — which is not
+    enough on macOS, where TCC / Full Disk Access provenance depends on the
+    executing process ancestry. So we pass ``defer_to_gateway_owner=True``:
+    when a gateway already owns the scheduler for this profile, this ticker
+    skips execution and lets the authorised gateway process chain run the job.
+    Only when no gateway is running (a desktop-only setup) does this ticker
+    execute jobs itself.
     """
     from cron.scheduler import tick as cron_tick
 
@@ -122,7 +127,7 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     # Tick once up front (catches jobs due at launch), then on the interval.
     while not stop_event.is_set():
         try:
-            cron_tick(verbose=False, sync=False)
+            cron_tick(verbose=False, sync=False, defer_to_gateway_owner=True)
         except Exception as e:
             _log.debug("Desktop cron tick error: %s", e)
         stop_event.wait(interval)
