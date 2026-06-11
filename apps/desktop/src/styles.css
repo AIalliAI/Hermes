@@ -823,6 +823,34 @@ canvas {
    content's --message-text-indent). No extra prose indent — a single gutter
    reads cleaner than a ragged tool-vs-reply column. */
 
+/* RTL / bidirectional text (#44150). Each paragraph-level block resolves its
+   base direction from its own first strong character (UAX#9 plaintext
+   heuristic): Arabic/Hebrew/Persian/Urdu paragraphs read right-to-left —
+   `text-align: start` follows the resolved direction, so they right-align
+   too — while English paragraphs stay LTR, and mixed conversations resolve
+   per paragraph. Covers assistant prose, user bubbles, and both composers
+   (main + edit share the composer-rich-input slot). List markers and indent
+   stay on the left: `direction` is deliberately untouched so RTL list items
+   reorder and right-align without mirroring the surrounding layout. */
+[data-slot='aui_assistant-message-content'] .aui-md :where(p, h1, h2, h3, h4, h5, h6, li, blockquote),
+[data-slot='aui_user-inline-text'],
+[data-slot='composer-rich-input'] {
+  unicode-bidi: plaintext;
+}
+
+/* Code stays left-to-right regardless of the surrounding paragraph: inline
+   code inside an RTL sentence renders as an isolated LTR run instead of
+   having its neutrals (dots, slashes, dashes) reordered by the bidi
+   algorithm. Fenced blocks (CodeCard / Shiki / user fences) already keep the
+   document's LTR `direction` — nothing above changes `direction`. KaTeX
+   output is pinned LTR too; math layout assumes it. */
+[data-slot='aui_assistant-message-content'] .aui-md :where(:not(pre) > code),
+[data-slot='aui_user-inline-code'],
+[data-slot='aui_assistant-message-content'] .aui-md .katex {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
 [data-slot='aui_user-message-root'] {
   top: var(--sticky-human-top);
 }
