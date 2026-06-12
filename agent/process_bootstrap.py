@@ -17,8 +17,10 @@ Three concerns, all tied to ``AIAgent`` boot-time / runtime IO setup:
    ``_get_proxy_for_base_url`` respects ``NO_PROXY`` for the given base URL.
 
 4. **TLS version override** — ``_get_tls_ssl_context`` honors
-   ``HERMES_TLS_MAX_VERSION`` so users behind TLS-1.3-hostile networks or
-   CDN edges can cap provider connections at TLS 1.2.
+   ``network.tls_max_version`` from config.yaml (bridged to the internal
+   ``HERMES_TLS_MAX_VERSION`` env var at startup) so users behind
+   TLS-1.3-hostile networks or CDN edges can cap provider connections
+   at TLS 1.2.
 
 ``run_agent`` re-exports every name so existing
 ``from run_agent import _get_proxy_from_env`` imports keep working
@@ -152,8 +154,12 @@ def _get_tls_ssl_context() -> Optional["ssl.SSLContext"]:
     Some CDN edges and middleboxes accept TLS 1.2 handshakes but kill
     TLS 1.3 ClientHellos, surfacing as ``[SSL: UNEXPECTED_EOF_WHILE_READING]``
     roughly 15s into every request while ``curl`` (which uses the OS TLS
-    stack on Windows/macOS) works fine (#44365, DeepSeek's edge).  Setting
-    ``HERMES_TLS_MAX_VERSION=1.2`` caps the handshake for provider traffic.
+    stack on Windows/macOS) works fine (#44365, DeepSeek's edge).  The
+    user-facing knob is ``network.tls_max_version: "1.2"`` in config.yaml,
+    bridged onto ``HERMES_TLS_MAX_VERSION`` at process startup by
+    ``hermes_constants.apply_tls_max_version`` (this layer has no config
+    access, and spawned agent subprocesses must inherit the cap; an
+    explicitly exported env var wins over config.yaml).
 
     Accepted values: ``1.2`` / ``1.3``, optionally prefixed ``tls``/``tlsv``
     (case-insensitive).  Returns ``None`` — meaning "use httpx defaults" —

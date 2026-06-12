@@ -3,9 +3,10 @@
 Some CDN edges and middleboxes accept TLS 1.2 handshakes but kill TLS 1.3
 ClientHellos, surfacing as ``[SSL: UNEXPECTED_EOF_WHILE_READING]`` ~15s into
 every request while ``curl`` (OS TLS stack) works fine — #44365 hit this on
-Windows desktop against DeepSeek's edge.  ``HERMES_TLS_MAX_VERSION=1.2``
-caps the handshake for the keepalive-enabled httpx.Client injected by
-``_create_openai_client``.
+Windows desktop against DeepSeek's edge.  ``network.tls_max_version: "1.2"``
+in config.yaml (bridged to the internal ``HERMES_TLS_MAX_VERSION`` env var by
+``hermes_constants.apply_tls_max_version`` at startup) caps the handshake for
+the keepalive-enabled httpx.Client injected by ``_create_openai_client``.
 
 httpx ignores client-level ``verify`` when an explicit ``transport`` is
 passed, so these tests pin that the context lands on the transport's pool —
@@ -118,3 +119,61 @@ def test_unset_env_keeps_default_tls(monkeypatch):
             assert ctx.maximum_version == ssl.TLSVersion.MAXIMUM_SUPPORTED
     finally:
         client.close()
+
+
+# ─── config.yaml bridge — hermes_constants.apply_tls_max_version ────────────
+
+
+def test_default_config_ships_tls_max_version_off():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["network"]["tls_max_version"] == ""
+
+
+def test_bridge_sets_env_from_config(monkeypatch):
+    from hermes_constants import apply_tls_max_version
+
+    _clear_env(monkeypatch)
+    apply_tls_max_version("1.2")
+    import os
+
+    # teardown: _clear_env's delenv already registered the key with
+    # monkeypatch, so the direct os.environ write is restored after the test
+    assert os.environ["HERMES_TLS_MAX_VERSION"] == "1.2"
+
+
+def test_bridge_does_not_override_explicit_env(monkeypatch):
+    from hermes_constants import apply_tls_max_version
+
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("HERMES_TLS_MAX_VERSION", "1.3")
+    apply_tls_max_version("1.2")
+    import os
+
+    assert os.environ["HERMES_TLS_MAX_VERSION"] == "1.3"
+
+
+def test_bridge_noop_on_empty(monkeypatch):
+    from hermes_constants import apply_tls_max_version
+
+    _clear_env(monkeypatch)
+    for value in ("", None, 0):
+        apply_tls_max_version(value)
+    import os
+
+    assert "HERMES_TLS_MAX_VERSION" not in os.environ
+
+
+def test_bridge_handles_yaml_float_and_whitespace(monkeypatch):
+    """yaml parses an unquoted ``tls_max_version: 1.2`` as a float."""
+    from hermes_constants import apply_tls_max_version
+
+    _clear_env(monkeypatch)
+    apply_tls_max_version(1.2)
+    ctx = _get_tls_ssl_context()
+    assert ctx is not None and ctx.maximum_version == ssl.TLSVersion.TLSv1_2
+
+    _clear_env(monkeypatch)
+    apply_tls_max_version("  1.2  ")
+    ctx = _get_tls_ssl_context()
+    assert ctx is not None and ctx.maximum_version == ssl.TLSVersion.TLSv1_2
