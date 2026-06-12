@@ -40,6 +40,10 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "interim_assistant_messages": True,
     "long_running_notifications": True,
     "busy_ack_detail": True,
+    # Busy follow-up handling while an agent is already running in the same
+    # session.  Platform overrides let chatty/team surfaces prefer queueing
+    # without changing CLI/DM defaults.
+    "busy_input_mode": "interrupt",
     # When true, delete tool-progress / "⏳ Working — N min" / status bubbles
     # after the final response lands on platforms that support message
     # deletion (e.g. Telegram). Off by default — progress is still shown
@@ -224,6 +228,9 @@ def _normalise(setting: str, value: Any) -> Any:
         if value is True:
             return "all"
         return str(value).lower()
+    if setting == "busy_input_mode":
+        value = str(value).strip().lower()
+        return value if value in {"interrupt", "queue", "steer"} else "interrupt"
     if setting in {
         "show_reasoning",
         "streaming",
