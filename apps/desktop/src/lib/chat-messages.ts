@@ -66,7 +66,7 @@ export type GatewayEventPayload = {
   // terminal.read.request (GUI agent reading the in-app terminal pane)
   start?: number
   count?: number
-  // status.update (background process notification poller)
+  // status.update (kind=process → background process completion/watch-match)
   kind?: string
   event_type?: string
   exit_code?: null | number
