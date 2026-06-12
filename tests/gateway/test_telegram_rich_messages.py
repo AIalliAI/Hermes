@@ -25,6 +25,27 @@ from telegram.error import BadRequest, NetworkError, TimedOut
 # and a task list. Pipes / brackets must survive untouched into the payload.
 RICH_CONTENT = "## Results\n\n| Case | Status |\n|---|---|\n| rich | ✅ |\n\n- [x] table renders"
 
+# PTB 22.6's real unknown-endpoint errors (verified against the wheel):
+# do_api_request raises EndPointNotFound on HTTP 404; the request layer can
+# wrap the same 404 as InvalidToken. Class NAMES and messages must match.
+EndPointNotFound = type("EndPointNotFound", (Exception,), {})
+InvalidToken = type("InvalidToken", (Exception,), {})
+PTB_ENDPOINT_NOT_FOUND = EndPointNotFound(
+    "Endpoint 'sendRichMessage' not found in Bot API"
+)
+PTB_INVALID_TOKEN_404 = InvalidToken(
+    "Either the bot token was rejected by Telegram or the endpoint "
+    "'sendRichMessage' does not exist."
+)
+
+
+class FakeRetryAfter(Exception):
+    """Mimics telegram.error.RetryAfter (flood control, HTTP 429)."""
+
+    def __init__(self, seconds: float):
+        super().__init__(f"Flood control exceeded. Retry in {seconds} seconds")
+        self.retry_after = seconds
+
 
 def _make_adapter(extra=None):
     """Build a TelegramAdapter with a mock bot wired for the rich path."""
@@ -42,10 +63,18 @@ def _make_adapter(extra=None):
 
 
 def _rich_api_kwargs(adapter):
-    """Return the api_kwargs dict from the single sendRichMessage call."""
+    """Return the api_kwargs dict from the last sendRichMessage call."""
     call = adapter._bot.do_api_request.call_args
     assert call.args[0] == "sendRichMessage"
     return call.kwargs["api_kwargs"]
+
+
+@pytest.fixture()
+def fast_sleep(monkeypatch):
+    """Neutralize retry backoff sleeps inside the adapter's send loops."""
+    sleeper = AsyncMock()
+    monkeypatch.setattr("gateway.platforms.telegram.asyncio.sleep", sleeper)
+    return sleeper
 
 
 @pytest.mark.asyncio
@@ -63,6 +92,30 @@ async def test_rich_happy_path_sends_raw_markdown():
     assert "| Case | Status |" in api_kwargs["rich_message"]["markdown"]
     assert "- [x] table renders" in api_kwargs["rich_message"]["markdown"]
     # Legacy path must not run on rich success.
+    adapter._bot.send_message.assert_not_called()
+    # Parity with the legacy success path: typing is re-triggered.
+    adapter._bot.send_chat_action.assert_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw,expected_id",
+    [
+        (SimpleNamespace(message_id=123), "123"),
+        ({"message_id": 123}, "123"),
+        ({"result": {"message_id": 123}}, "123"),
+        ({"result": None}, None),  # malformed envelope must not crash
+    ],
+)
+async def test_rich_result_shapes_extract_message_id(raw, expected_id):
+    """Without return_type, real PTB returns the raw dict — handle all shapes."""
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(return_value=raw)
+
+    result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    assert result.message_id == expected_id
     adapter._bot.send_message.assert_not_called()
 
 
@@ -90,9 +143,9 @@ async def test_rich_opt_out_accepts_string_false():
 @pytest.mark.asyncio
 async def test_oversized_content_skips_rich_and_chunks():
     adapter = _make_adapter()
-    # > 32,768 UTF-8 bytes -> rich pre-check fails, legacy chunking takes over.
+    # > 32,768 characters -> rich pre-check fails, legacy chunking takes over.
     oversized = "a" * 40000
-    assert len(oversized.encode("utf-8")) > TelegramAdapter.RICH_MESSAGE_MAX_BYTES
+    assert len(oversized) > TelegramAdapter.RICH_MESSAGE_MAX_CHARS
 
     result = await adapter.send("12345", oversized)
 
@@ -103,11 +156,29 @@ async def test_oversized_content_skips_rich_and_chunks():
 
 
 @pytest.mark.asyncio
+async def test_rich_limit_is_characters_not_bytes():
+    """The Bot API limit is 32,768 UTF-8 *characters*; multi-byte text under
+    the character cap must stay on the rich path even when its UTF-8 byte
+    length exceeds 32,768 (CJK/emoji-heavy locales)."""
+    adapter = _make_adapter()
+    cjk = "测" * 20000  # 20k chars, 60k UTF-8 bytes
+    assert len(cjk.encode("utf-8")) > 32768
+    assert len(cjk) <= TelegramAdapter.RICH_MESSAGE_MAX_CHARS
+
+    result = await adapter.send("12345", cjk)
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_awaited_once()
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "exc",
     [
         BadRequest("can't parse rich message"),
         BadRequest("Method not found"),
+        RuntimeError("Method not found"),  # non-BadRequest capability signal
     ],
 )
 async def test_permanent_rich_error_falls_back_to_legacy(exc):
@@ -122,41 +193,119 @@ async def test_permanent_rich_error_falls_back_to_legacy(exc):
 
 
 @pytest.mark.asyncio
-async def test_unknown_endpoint_error_falls_back_to_legacy():
-    """A non-BadRequest 'Method not found' (old PTB/endpoint) degrades gracefully."""
-    adapter = _make_adapter()
-    adapter._bot.do_api_request = AsyncMock(side_effect=RuntimeError("Method not found"))
-
-    result = await adapter.send("12345", RICH_CONTENT)
-
-    assert result.success is True
-    adapter._bot.send_message.assert_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("exc", [TimedOut("timed out"), NetworkError("connection reset")])
-async def test_transient_rich_error_does_not_legacy_resend(exc):
-    """Transient transport errors must NOT trigger a legacy resend (duplicate risk)."""
+@pytest.mark.parametrize("exc", [PTB_ENDPOINT_NOT_FOUND, PTB_INVALID_TOKEN_404])
+async def test_real_ptb_endpoint_missing_falls_back_and_latches_off(exc):
+    """PTB 22.6's actual unknown-endpoint errors (EndPointNotFound, and the
+    request layer's InvalidToken wrap of HTTP 404) must fall back to legacy —
+    a server without Bot API 10.1 would otherwise lose EVERY message — and
+    latch rich sends off so later sends skip the doomed round-trip."""
     adapter = _make_adapter()
     adapter._bot.do_api_request = AsyncMock(side_effect=exc)
 
     result = await adapter.send("12345", RICH_CONTENT)
 
-    assert result.success is False
+    assert result.success is True
     adapter._bot.do_api_request.assert_awaited_once()
+    adapter._bot.send_message.assert_awaited()
+    assert adapter._rich_send_disabled is True
+
+    # Subsequent sends go straight to legacy without re-trying rich.
+    adapter._bot.do_api_request.reset_mock()
+    adapter._bot.send_message.reset_mock()
+    result2 = await adapter.send("12345", RICH_CONTENT)
+    assert result2.success is True
+    adapter._bot.do_api_request.assert_not_called()
+    adapter._bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_content_parse_badrequest_does_not_latch_sends_off():
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(side_effect=BadRequest("can't parse rich message"))
+
+    result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    assert adapter._rich_send_disabled is False  # content error, not capability
+
+
+@pytest.mark.asyncio
+async def test_flood_control_retries_rich_in_place(fast_sleep):
+    """RetryAfter (HTTP 429) means Telegram rejected the request — retrying
+    the rich call after the mandated wait is duplicate-safe and must not
+    drop the message or fall back to legacy."""
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(
+        side_effect=[FakeRetryAfter(5), SimpleNamespace(message_id=7)]
+    )
+
+    result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    assert result.message_id == "7"
+    assert adapter._bot.do_api_request.await_count == 2
+    adapter._bot.send_message.assert_not_called()
+    # The server-mandated wait was honored.
+    assert any(call.args[0] == 5.0 for call in fast_sleep.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_network_error_retries_then_fails_retryable(fast_sleep):
+    """Pre-connect network errors retry with backoff (legacy parity); after
+    exhaustion the failure is retryable and never legacy-resent."""
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(side_effect=NetworkError("connection reset"))
+
+    result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is False
+    assert result.retryable is True
+    assert adapter._bot.do_api_request.await_count == 3
     adapter._bot.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_transient_timeout_is_not_retryable():
+async def test_network_error_recovers_on_retry(fast_sleep):
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(
+        side_effect=[NetworkError("connection reset"), SimpleNamespace(message_id=9)]
+    )
+
+    result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    assert result.message_id == "9"
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_transient_timeout_does_not_retry_or_legacy_resend():
+    """A plain (non-connect) timeout may have reached Telegram: exactly one
+    attempt, no legacy resend, and non-retryable so upstream doesn't re-send."""
     adapter = _make_adapter()
     adapter._bot.do_api_request = AsyncMock(side_effect=TimedOut("timed out"))
 
     result = await adapter.send("12345", RICH_CONTENT)
 
-    # A plain timeout may have reached Telegram -> non-retryable (no auto-resend).
     assert result.success is False
     assert result.retryable is False
+    assert adapter._bot.do_api_request.await_count == 1
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_connect_timeout_retries_and_is_retryable(fast_sleep):
+    """A connect-timeout never reached Telegram — safe to retry in place and
+    safe for upstream to retry the send."""
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(side_effect=TimedOut("connect timed out"))
+
+    result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is False
+    assert result.retryable is True
+    assert adapter._bot.do_api_request.await_count == 3
+    adapter._bot.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -184,13 +333,48 @@ async def test_routing_direct_messages_topic_id_drops_message_thread_id():
 
 
 @pytest.mark.asyncio
-async def test_reply_to_propagates_as_scalar():
+async def test_reply_to_propagates_as_reply_parameters():
+    """sendRichMessage takes reply_parameters; the pre-7.0 scalar
+    reply_to_message_id is not part of the 10.1 contract."""
     adapter = _make_adapter()
 
     await adapter.send("-100123", RICH_CONTENT, reply_to="999")
 
     api_kwargs = _rich_api_kwargs(adapter)
-    assert api_kwargs["reply_to_message_id"] == 999
+    assert api_kwargs["reply_parameters"] == {"message_id": 999}
+    assert "reply_to_message_id" not in api_kwargs
+
+
+@pytest.mark.asyncio
+async def test_reply_to_combined_with_thread_id():
+    """Replying inside a forum topic must carry BOTH routing fields."""
+    adapter = _make_adapter()
+
+    await adapter.send(
+        "-100123", RICH_CONTENT, reply_to="999", metadata={"thread_id": "5"}
+    )
+
+    api_kwargs = _rich_api_kwargs(adapter)
+    assert api_kwargs["message_thread_id"] == 5
+    assert api_kwargs["reply_parameters"] == {"message_id": 999}
+
+
+@pytest.mark.asyncio
+async def test_dm_topic_fail_loud_skips_rich_and_refuses():
+    """DM-topic sends without a reply anchor must refuse loudly via the
+    legacy path — the rich path must not send outside the requested topic."""
+    adapter = _make_adapter()
+
+    result = await adapter.send(
+        "123",  # private chat id
+        RICH_CONTENT,
+        metadata={"thread_id": "20197", "telegram_dm_topic_reply_fallback": True},
+    )
+
+    assert result.success is False
+    assert "reply anchor" in (result.error or "")
+    adapter._bot.do_api_request.assert_not_called()
+    adapter._bot.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -214,12 +398,49 @@ async def test_notification_opt_in_drops_disable_flag():
 
 
 @pytest.mark.asyncio
+async def test_disable_link_previews_carries_to_rich_payload():
+    adapter = _make_adapter(extra={"disable_link_previews": True})
+
+    await adapter.send("-100123", RICH_CONTENT)
+
+    api_kwargs = _rich_api_kwargs(adapter)
+    assert api_kwargs["link_preview_options"] == {"is_disabled": True}
+
+
+@pytest.mark.asyncio
+async def test_link_previews_enabled_by_default_in_rich_payload():
+    adapter = _make_adapter()
+
+    await adapter.send("-100123", RICH_CONTENT)
+
+    api_kwargs = _rich_api_kwargs(adapter)
+    assert "link_preview_options" not in api_kwargs
+
+
+@pytest.mark.asyncio
+async def test_expect_edits_metadata_skips_rich():
+    """Sends that will be edited later (streaming previews, tool-progress and
+    status bubbles) must stay on the editable MarkdownV2 path — editing a
+    rich-born message would flip its rendering format."""
+    adapter = _make_adapter()
+
+    result = await adapter.send(
+        "12345", RICH_CONTENT, metadata={"expect_edits": True}
+    )
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_not_called()
+    adapter._bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
 async def test_rich_gate_tolerates_missing_enabled_attr():
     """Adapters missing _rich_messages_enabled (object.__new__ in some tests)
     must not raise — the gate reads it via getattr(default=True), and a bot
     without an async do_api_request falls through to the legacy path."""
     adapter = _make_adapter()
     del adapter._rich_messages_enabled  # simulate object.__new__ construction
+    del adapter._rich_send_disabled
     # SimpleNamespace bot has no do_api_request -> _bot_supports_rich() False.
     adapter._bot = SimpleNamespace(
         send_message=AsyncMock(return_value=SimpleNamespace(message_id=42)),
@@ -254,9 +475,17 @@ async def test_rich_draft_happy_path_sends_raw_markdown():
 
 
 @pytest.mark.asyncio
-async def test_rich_draft_capability_failure_falls_back_and_latches_off():
+@pytest.mark.parametrize(
+    "exc",
+    [
+        BadRequest("Method not found"),
+        PTB_ENDPOINT_NOT_FOUND,
+        PTB_INVALID_TOKEN_404,
+    ],
+)
+async def test_rich_draft_capability_failure_falls_back_and_latches_off(exc):
     adapter = _make_adapter()
-    adapter._bot.do_api_request = AsyncMock(side_effect=BadRequest("Method not found"))
+    adapter._bot.do_api_request = AsyncMock(side_effect=exc)
 
     result = await adapter.send_draft("12345", draft_id=7, content=RICH_CONTENT)
 
@@ -271,6 +500,29 @@ async def test_rich_draft_capability_failure_falls_back_and_latches_off():
     assert result2.success is True
     adapter._bot.do_api_request.assert_not_called()
     adapter._bot.send_message_draft.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rich_draft_parse_error_does_not_latch_off():
+    """Draft frames carry PARTIAL markdown (open fences, unterminated tables)
+    — a per-frame parse 400 must fall back for that frame only, NOT disable
+    rich drafts for the adapter's lifetime."""
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(side_effect=BadRequest("can't parse rich message"))
+
+    result = await adapter.send_draft("12345", draft_id=7, content=RICH_CONTENT)
+
+    assert result.success is True  # legacy draft carried this frame
+    adapter._bot.send_message_draft.assert_awaited_once()
+    assert adapter._rich_draft_disabled is False
+
+    # The next frame tries rich again.
+    adapter._bot.do_api_request.reset_mock()
+    adapter._bot.do_api_request.side_effect = None
+    adapter._bot.do_api_request.return_value = True
+    result2 = await adapter.send_draft("12345", draft_id=7, content=RICH_CONTENT)
+    assert result2.success is True
+    adapter._bot.do_api_request.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -900,7 +900,7 @@ gateway:
 
 ## Rendering: Rich Messages, Tables and Link Previews
 
-**Rich Messages (Bot API 10.1).** Final replies are sent with Telegram's native [`sendRichMessage`](https://core.telegram.org/bots/api#sendrichmessage) using the agent's **raw markdown**, so tables, task lists, headings, nested blockquotes, collapsible `<details>`, footnotes/references, math/formulas, underline, sub/superscript, marked text, and anchors render natively — no client-side flattening. In DMs the live streaming preview also uses `sendRichMessageDraft`, so the animated draft matches the final rich message. This is **on by default**; disable it (forcing the legacy MarkdownV2 path below) per platform:
+**Rich Messages (Bot API 10.1).** Final replies are sent with Telegram's native [`sendRichMessage`](https://core.telegram.org/bots/api#sendrichmessage) using the agent's **raw markdown**, so tables, task lists, headings, nested blockquotes, collapsible `<details>`, footnotes/references, math/formulas, underline, sub/superscript, marked text, and anchors render natively — no client-side flattening. When native draft streaming is enabled (`streaming.transport: auto` or `draft`, DMs only, python-telegram-bot 22.6+), the live preview uses `sendRichMessageDraft` so the animated draft matches the final rich message. Edit-based streaming (groups, and the default `edit` transport) keeps the streamed bubble on MarkdownV2 end-to-end so the format never flips mid-message. Rich sends are **on by default**; disable them (forcing the legacy MarkdownV2 path below) per platform:
 
 ```yaml
 gateway:
@@ -910,14 +910,9 @@ gateway:
         rich_messages: false
 ```
 
-The rich path is skipped automatically when content exceeds the 32,768-byte rich text limit, and any rejection from Telegram (unsupported endpoint on an older `python-telegram-bot`, parser error, oversized blocks/columns) **transparently falls back** to the MarkdownV2 path — your message is never lost. Transient/network errors are *not* silently re-sent (no duplicate final message).
+The rich path is skipped automatically when content exceeds the 32,768-character rich text limit, and any rejection from Telegram (missing endpoint on an older Bot API server, parser error, oversized blocks/columns) **transparently falls back** to the MarkdownV2 path — your message is never lost. A missing-endpoint error additionally disables further rich attempts for the session so every message doesn't pay a doomed round-trip. Flood control (`retry_after`) is honored with in-place retries, exactly like the legacy path; other transient/network errors are *not* silently re-sent (no duplicate final message).
 
-**MarkdownV2 fallback.** When the rich path is disabled or unavailable, Hermes converts markdown to MarkdownV2. Since MarkdownV2 has no native table syntax, pipe tables are normalized:
-
-- **Small tables** are flattened into **row-group bullets** — each row becomes a readable bulleted list under the column headings. Good for 2–4 columns and short cells.
-- **Larger or wider tables** fall back to a **fenced code block** with aligned columns so nothing collapses.
-
-There's nothing to configure for the fallback — the adapter picks the right rendering per message. If you want the legacy "always code-block" behavior, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
+**MarkdownV2 fallback.** When the rich path is disabled or unavailable, Hermes converts markdown to MarkdownV2. Since MarkdownV2 has no native table syntax, pipe tables are normalized into **row-group bullets** — each row becomes a readable bulleted list under the column headings. There's nothing to configure for the fallback; it applies automatically per message.
 
 **Link previews.** Telegram auto-generates link previews for URLs in bot messages. If you'd rather suppress those (long `/tools` output, agent reply that mentions ten links, etc.):
 

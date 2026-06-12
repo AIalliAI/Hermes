@@ -281,12 +281,14 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     )
 
     assert result["final_response"] == "done"
+    # expect_edits: the progress bubble is edited on later tool events, so
+    # adapters with a rich send path keep it on the editable legacy format.
     assert adapter.sent == [
         {
             "chat_id": "-1001",
             "content": '💻 terminal: "pwd"',
             "reply_to": None,
-            "metadata": {"thread_id": "17585"},
+            "metadata": {"thread_id": "17585", "expect_edits": True},
         }
     ]
     assert adapter.edits
@@ -369,7 +371,10 @@ async def test_run_agent_progress_does_not_use_event_message_id_for_telegram_dm(
 
     assert result["final_response"] == "done"
     assert adapter.sent
-    assert adapter.sent[0]["metadata"] is None
+    # No thread routing may leak in (expect_edits is the only key — it marks
+    # the bubble as edit-targeted for adapters with a rich send path).
+    assert adapter.sent[0]["metadata"] == {"expect_edits": True}
+    assert "thread_id" not in adapter.sent[0]["metadata"]
     assert all(call["metadata"] is None for call in adapter.typing)
 
 
@@ -419,7 +424,10 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
 
     assert result["final_response"] == "done"
     assert adapter.sent
-    assert adapter.sent[0]["metadata"] == {"thread_id": "1234567890.000001"}
+    assert adapter.sent[0]["metadata"] == {
+        "thread_id": "1234567890.000001",
+        "expect_edits": True,
+    }
     assert all(call["metadata"] == {"thread_id": "1234567890.000001"} for call in adapter.typing)
 
 
@@ -462,7 +470,10 @@ async def test_run_agent_feishu_progress_replies_inside_existing_thread(monkeypa
     assert result["final_response"] == "done"
     assert adapter.sent
     assert adapter.sent[0]["reply_to"] == "om_triggering_user_message"
-    assert adapter.sent[0]["metadata"] == {"thread_id": "topic_17585"}
+    assert adapter.sent[0]["metadata"] == {
+        "thread_id": "topic_17585",
+        "expect_edits": True,
+    }
     assert adapter.edits
     assert adapter.edits[0]["message_id"] == "progress-1"
 
