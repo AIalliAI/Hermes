@@ -1519,6 +1519,10 @@ AUTHOR_MAP = {
     "chanhokyim@gmail.com": "joel611",  # PR #33958 salvage (DISCORD_ALLOWED_ROLES role_authorized gateway flag)
     "desg38@gmail.com": "dschnurbusch",  # PR #42373 salvage (archive compressed conversation lineages)
     "bsmith@bramarstrategicservices.com": "bcsmith528",  # PR #20589 salvage (register_slack_action_handler plugin API)
+    "adalsteinnhelgason@Aalsteinns-MacBook-Pro-3.local": "AIalliAI",
+    "adalsteinnhelgason@users.noreply.github.com": "AIalliAI",
+    "aialli@users.noreply.github.com": "AIalliAI",
+    "jvsantos.cunha@gmail.com": "plcunha",  # PR #44460 (bound CDP reconnect loop), cherry-picked
 }
 
 
