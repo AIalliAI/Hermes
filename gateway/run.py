@@ -3393,11 +3393,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not mode:
             cfg = _load_gateway_runtime_config()
             mode = str(cfg_get(cfg, "display", "busy_input_mode", default="") or "").strip().lower()
-        if mode == "queue":
-            return "queue"
-        if mode == "steer":
-            return "steer"
-        return "interrupt"
+        return GatewayRunner._normalize_busy_input_mode(mode)
+
+    @staticmethod
+    def _normalize_busy_input_mode(mode: Any, *, default: str = "interrupt") -> str:
+        value = str(mode or "").strip().lower()
+        if value in {"interrupt", "queue", "steer"}:
+            return value
+        return default if default in {"interrupt", "queue", "steer"} else "interrupt"
+
+    def _resolve_busy_input_mode_for_source(self, source: SessionSource) -> str:
+        """Resolve busy-input mode, honoring per-platform display overrides.
+
+        ``display.busy_input_mode`` remains the global default.  Messaging
+        surfaces can opt into safer queue/steer behavior without changing CLI
+        semantics via ``display.platforms.<platform>.busy_input_mode`` or the
+        equivalent env var ``HERMES_GATEWAY_BUSY_INPUT_MODE_<PLATFORM>``.
+        """
+        default = self._normalize_busy_input_mode(getattr(self, "_busy_input_mode", "interrupt"))
+        try:
+            platform_key = _platform_config_key(source.platform)
+        except Exception:
+            return default
+
+        env_key = f"HERMES_GATEWAY_BUSY_INPUT_MODE_{platform_key.upper().replace('-', '_')}"
+        env_mode = os.getenv(env_key, "").strip()
+        if env_mode:
+            return self._normalize_busy_input_mode(env_mode, default=default)
+
+        try:
+            cfg = _load_gateway_config()
+            display_cfg = cfg.get("display") or {}
+            platforms_cfg = display_cfg.get("platforms") or {}
+            platform_cfg = platforms_cfg.get(platform_key)
+            if isinstance(platform_cfg, dict) and platform_cfg.get("busy_input_mode") is not None:
+                return self._normalize_busy_input_mode(
+                    platform_cfg.get("busy_input_mode"),
+                    default=default,
+                )
+        except Exception:
+            return default
+        return default
 
     @staticmethod
     def _load_busy_text_mode() -> str:
@@ -3702,7 +3738,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         running_agent = self._running_agents.get(session_key)
 
-        effective_mode = self._busy_input_mode
+        effective_mode = self._resolve_busy_input_mode_for_source(event.source)
         busy_text_mode = getattr(self, "_busy_text_mode", "interrupt")
         if (
             event.message_type == MessageType.TEXT
