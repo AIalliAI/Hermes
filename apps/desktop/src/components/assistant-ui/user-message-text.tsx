@@ -127,8 +127,8 @@ const InlineSegmentView: FC<{ text: string }> = ({ text }) => {
   const nodes = useMemo(() => splitInlineCode(text), [text])
 
   return (
-    // data-slot is the styles.css hook for per-line bidi direction (#44150);
-    // whitespace-pre-line makes each newline a UAX#9 paragraph boundary.
+    // styles.css bidi hook (#44150); whitespace-pre-line makes each line its own
+    // UAX#9 paragraph so it resolves direction independently.
     <span className="wrap-anywhere block whitespace-pre-line" data-slot="aui_user-inline-text">
       {nodes.map((node, nodeIndex) =>
         node.kind === 'inline-code' ? (
