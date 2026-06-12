@@ -308,6 +308,43 @@ async def test_connect_timeout_retries_and_is_retryable(fast_sleep):
     adapter._bot.send_message.assert_not_called()
 
 
+_POOL_TIMEOUT_MSG = (
+    "Pool timeout: All connections in the connection pool are occupied. "
+    "Request was *not* sent to Telegram."
+)
+
+
+@pytest.mark.asyncio
+async def test_pool_timeout_retries_and_is_retryable(fast_sleep):
+    """An httpx pool timeout is explicitly "not sent to Telegram" — like the
+    legacy path, retry in place and stay retryable so the send isn't dropped."""
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(side_effect=TimedOut(_POOL_TIMEOUT_MSG))
+
+    result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is False
+    assert result.retryable is True
+    assert adapter._bot.do_api_request.await_count == 3
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pool_timeout_recovers_on_retry(fast_sleep):
+    """A pool timeout followed by a freed-up pool delivers on the retry."""
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(
+        side_effect=[TimedOut(_POOL_TIMEOUT_MSG), SimpleNamespace(message_id=321)]
+    )
+
+    result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    assert result.message_id == "321"
+    assert adapter._bot.do_api_request.await_count == 2
+    adapter._bot.send_message.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_routing_thread_id_maps_to_message_thread_id():
     adapter = _make_adapter()

@@ -1164,12 +1164,19 @@ class TelegramAdapter(BasePlatformAdapter):
                         continue
                 is_timeout = (_TimedOut and isinstance(exc, _TimedOut)) or "timed out" in err_str
                 is_connect_timeout = self._looks_like_connect_timeout(exc)
+                is_pool_timeout = self._looks_like_pool_timeout(exc)
                 # Pre-connect / generic network errors never reached Telegram —
-                # retry with the legacy backoff. A plain timeout may have
-                # landed, so it falls through to the no-resend return below.
+                # retry with the legacy backoff. An httpx pool timeout is
+                # explicitly "not sent to Telegram", so it retries too. A plain
+                # timeout may have landed, so it falls through to the no-resend
+                # return below.
                 if (
                     _attempt < 2
-                    and (is_connect_timeout or (not is_timeout and self._looks_like_network_error(exc)))
+                    and (
+                        is_connect_timeout
+                        or is_pool_timeout
+                        or (not is_timeout and self._looks_like_network_error(exc))
+                    )
                 ):
                     wait = 2 ** _attempt
                     logger.warning(
@@ -1188,7 +1195,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return SendResult(
                     success=False,
                     error=str(exc),
-                    retryable=(is_connect_timeout or not is_timeout),
+                    retryable=(is_connect_timeout or is_pool_timeout or not is_timeout),
                 )
 
         message_id = None
