@@ -48,6 +48,8 @@ AUTHOR_MAP = {
     "kenmege@yahoo.com": "Kenmege",
     "peterhao@Peters-MacBook-Air.local": "pinguarmy",
     "adalsteinnhelgason@Aalsteinns-MacBook-Pro-3.local": "AIalliAI",
+    "adalsteinnhelgason@users.noreply.github.com": "AIalliAI",
+    "zhang.hz6666@gmail.com": "HaozheZhang6",
     "barronlroth@gmail.com": "barronlroth",
     "ondrej.drapalik@gmail.com": "OndrejDrapalik",
     "tomasz.panek@gmail.com": "tomekpanek",
@@ -79,6 +81,9 @@ AUTHOR_MAP = {
     "290859878+synapsesx@users.noreply.github.com": "synapsesx",
     "157689911+itsflownium@users.noreply.github.com": "itsflownium",
     "dirtyren@users.noreply.github.com": "dirtyren",
+    "achaljhawar03@gmail.com": "achaljhawar",
+    "claytonchew@ClaytonMacMiniM4.local": "claytonchew",
+    "hbentel@gmail.com": "hbentel",
     "JustinBao@outlook.com": "justinbao19",
     "kdunn926@gmail.com": "kdunn926",
     "mvanhorn@MacBook-Pro.local": "mvanhorn",
@@ -491,6 +496,7 @@ AUTHOR_MAP = {
     "20nik.nosov21@gmail.com": "nik1t7n",
     "90299797+nik1t7n@users.noreply.github.com": "nik1t7n",
     "suncokret@protonmail.com": "suncokret12",
+    "WompaJango@protonmail.com": "WompaJango",
     "mio.imoto.ai@gmail.com": "mioimotoai-lgtm",
     "aamirjawaid@microsoft.com": "heyitsaamir",
     "johnnncenaaa77@gmail.com": "johnncenae",
@@ -1529,6 +1535,7 @@ AUTHOR_MAP = {
     "aialli@users.noreply.github.com": "AIalliAI",
     "jvsantos.cunha@gmail.com": "plcunha",  # PR #44460 (bound CDP reconnect loop), cherry-picked
     "support@captureclient.net": "eazye19",  # PR #43298 (mock detached hermes update in platform-gate tests), cherry-picked
+    "sunsky.lau@gmail.com": "liuhao1024",  # PR #45494 salvage (claim session slot before auto-resume task; #45456)
 }
 
 

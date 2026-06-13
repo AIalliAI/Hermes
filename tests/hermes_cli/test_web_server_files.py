@@ -193,6 +193,33 @@ def test_local_mode_defaults_to_home_and_can_jump_to_absolute_path(local_files_c
     assert other_listing.json()["entries"][0]["path"] == str(other / "other.txt")
 
 
+def test_gated_local_mode_still_defaults_to_home(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.delenv("HERMES_DASHBOARD_FILES_ROOT", raising=False)
+    monkeypatch.delenv("HERMES_MANAGED", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
+
+    prev_auth_required = getattr(web_server.app.state, "auth_required", None)
+    prev_bound_host = getattr(web_server.app.state, "bound_host", None)
+    web_server.app.state.auth_required = True
+    web_server.app.state.bound_host = "0.0.0.0"
+    try:
+        request = SimpleNamespace(
+            app=web_server.app,
+            client=SimpleNamespace(host="10.0.0.2"),
+            url=SimpleNamespace(hostname="example.com"),
+        )
+        policy = web_server._managed_files_policy(request, create_root=False)
+    finally:
+        _restore_app_state(prev_auth_required, prev_bound_host)
+
+    assert policy.default_path == home.resolve()
+    assert policy.locked_root is None
+    assert policy.can_change_path is True
+
+
 def test_local_mode_upload_read_mkdir_delete_roundtrip(local_files_client):
     client, home = local_files_client
     folder = home / "workspace"
@@ -265,49 +292,4 @@ def test_hosted_policy_locks_remote_requests_to_opt_data(monkeypatch):
         client.close()
 
     assert str(policy.locked_root) == "/opt/data"
-    assert policy.can_change_path is False
-
-
-def test_remote_request_on_host_install_locks_to_home(monkeypatch, tmp_path):
-    """Regression test for #44116: LAN access to a non-Docker install must not
-    force the Docker-only /opt/data root."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.delenv("HERMES_DASHBOARD_FILES_ROOT", raising=False)
-    monkeypatch.delenv("HERMES_HOME", raising=False)
-    monkeypatch.setenv("HOME", str(home))
-
-    client, prev_auth_required, prev_bound_host = _client_with_app_state()
-    try:
-        policy = web_server._managed_files_policy(_remote_request(), create_root=False)
-    finally:
-        _restore_app_state(prev_auth_required, prev_bound_host)
-        client.close()
-
-    assert policy.locked_root == home.resolve()
-    assert policy.default_path == home.resolve()
-    assert policy.can_change_path is False
-
-
-def test_auth_required_on_host_install_locks_to_home(monkeypatch, tmp_path):
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.delenv("HERMES_DASHBOARD_FILES_ROOT", raising=False)
-    monkeypatch.delenv("HERMES_HOME", raising=False)
-    monkeypatch.setenv("HOME", str(home))
-
-    client, prev_auth_required, prev_bound_host = _client_with_app_state()
-    web_server.app.state.auth_required = True
-    try:
-        request = SimpleNamespace(
-            app=web_server.app,
-            client=SimpleNamespace(host="127.0.0.1"),
-            url=SimpleNamespace(hostname="127.0.0.1"),
-        )
-        policy = web_server._managed_files_policy(request, create_root=False)
-    finally:
-        _restore_app_state(prev_auth_required, prev_bound_host)
-        client.close()
-
-    assert policy.locked_root == home.resolve()
     assert policy.can_change_path is False

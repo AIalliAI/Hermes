@@ -27,17 +27,8 @@ RICH_CONTENT = "## Results\n\n| Case | Status |\n|---|---|\n| rich | ✅ |\n\n- 
 
 
 def _make_adapter(extra=None):
-    """Build a TelegramAdapter with a mock bot wired for the rich path.
-
-    Rich messages are opt-in (default off) while the Bot API 10.1 endpoint
-    is validated live, so tests that exercise the rich path enable it
-    explicitly here; opt-out tests pass their own ``extra``.
-    """
-    config = PlatformConfig(
-        enabled=True,
-        token="fake-token",
-        extra={"rich_messages": True} if extra is None else extra,
-    )
+    """Build a TelegramAdapter with a mock bot wired for the rich path."""
+    config = PlatformConfig(enabled=True, token="fake-token", extra=extra or {})
     adapter = TelegramAdapter(config)
     bot = MagicMock()
     # do_api_request as an AsyncMock makes inspect.iscoroutinefunction(...) True,
@@ -76,24 +67,35 @@ async def test_rich_happy_path_sends_raw_markdown():
 
 
 @pytest.mark.asyncio
-async def test_rich_opt_out_uses_legacy():
+async def test_legacy_rich_messages_config_is_ignored():
     adapter = _make_adapter(extra={"rich_messages": False})
 
     result = await adapter.send("12345", RICH_CONTENT)
 
     assert result.success is True
-    adapter._bot.do_api_request.assert_not_called()
-    adapter._bot.send_message.assert_awaited()
+    # The legacy toggle was removed; stale config entries must not disable the
+    # rich path.
+    adapter._bot.do_api_request.assert_awaited_once()
+    adapter._bot.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_rich_opt_out_accepts_string_false():
-    adapter = _make_adapter(extra={"rich_messages": "false"})
+async def test_expect_edits_metadata_keeps_preview_on_legacy_path():
+    adapter = _make_adapter()
 
-    await adapter.send("12345", RICH_CONTENT)
+    result = await adapter.send(
+        "12345",
+        RICH_CONTENT,
+        metadata={"expect_edits": True},
+    )
 
-    adapter._bot.do_api_request.assert_not_called()
-    adapter._bot.send_message.assert_awaited()
+    assert result.success is True
+    # Streaming preview sends will be edited later, so they must not be born as
+    # rich messages until Hermes wires rich_message edits directly.
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request.assert_not_called()
+    bot.send_message.assert_awaited()
 
 
 @pytest.mark.asyncio
@@ -265,13 +267,9 @@ async def test_notification_opt_in_drops_disable_flag():
 
 
 @pytest.mark.asyncio
-async def test_rich_gate_tolerates_missing_enabled_attr():
-    """Adapters missing _rich_messages_enabled (object.__new__ in some tests)
-    must not raise — the gate reads it via getattr(default=True), and a bot
-    without an async do_api_request falls through to the legacy path."""
+async def test_rich_gate_tolerates_minimal_bot_without_raw_endpoint():
+    """A bot without an async do_api_request falls through to the legacy path."""
     adapter = _make_adapter()
-    del adapter._rich_messages_enabled  # simulate object.__new__ construction
-    # SimpleNamespace bot has no do_api_request -> _bot_supports_rich() False.
     adapter._bot = SimpleNamespace(
         send_message=AsyncMock(return_value=SimpleNamespace(message_id=42)),
         send_chat_action=AsyncMock(),
@@ -338,17 +336,6 @@ async def test_rich_draft_transient_failure_does_not_latch_off():
 
 
 @pytest.mark.asyncio
-async def test_rich_draft_opt_out_uses_legacy():
-    adapter = _make_adapter(extra={"rich_messages": False})
-
-    result = await adapter.send_draft("12345", draft_id=7, content=RICH_CONTENT)
-
-    assert result.success is True
-    adapter._bot.do_api_request.assert_not_called()
-    adapter._bot.send_message_draft.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_rich_draft_oversized_uses_legacy():
     adapter = _make_adapter()
     oversized = "a" * 40000
@@ -358,3 +345,40 @@ async def test_rich_draft_oversized_uses_legacy():
     assert result.success is True
     adapter._bot.do_api_request.assert_not_called()
     adapter._bot.send_message_draft.assert_awaited_once()
+
+
+# ----------------------------------------------------------------------
+# prefers_fresh_final_streaming: the stream consumer asks the adapter whether
+# to finalize a streamed reply by sending a fresh (rich) message + deleting the
+# preview, instead of final-editing the preview through the non-rich edit path.
+# Telegram opts in exactly when the content is rich-eligible.
+# ----------------------------------------------------------------------
+def test_prefers_fresh_final_streaming_when_rich_enabled():
+    adapter = _make_adapter()
+    assert adapter.prefers_fresh_final_streaming(RICH_CONTENT) is True
+
+
+def test_prefers_fresh_final_streaming_ignores_legacy_toggle():
+    adapter = _make_adapter(extra={"rich_messages": False})
+    assert adapter.prefers_fresh_final_streaming(RICH_CONTENT) is True
+
+
+# ----------------------------------------------------------------------
+# streaming_overflow_limit: with rich on, the stream consumer may accumulate up
+# to the 32,768-char rich cap before splitting, so a reply that fits one
+# sendRichMessage / sendRichMessageDraft isn't fragmented at the 4,096 limit.
+# ----------------------------------------------------------------------
+def test_streaming_overflow_limit_is_rich_cap_when_enabled():
+    adapter = _make_adapter()
+    assert adapter.streaming_overflow_limit() == TelegramAdapter.RICH_MESSAGE_MAX_CHARS
+
+
+def test_streaming_overflow_limit_ignores_legacy_toggle():
+    adapter = _make_adapter(extra={"rich_messages": False})
+    assert adapter.streaming_overflow_limit() == TelegramAdapter.RICH_MESSAGE_MAX_CHARS
+
+
+def test_streaming_overflow_limit_none_when_rich_latched_off():
+    adapter = _make_adapter()
+    adapter._rich_send_disabled = True
+    assert adapter.streaming_overflow_limit() is None
