@@ -91,13 +91,7 @@ class TestInitialReplyToId:
 
     @pytest.mark.asyncio
     async def test_metadata_passed_on_first_send(self):
-        """Metadata (containing thread_id) should be forwarded on first send.
-
-        The first send is a streaming preview that gets edited afterwards, so
-        the consumer additionally marks it ``expect_edits`` — adapters with a
-        rich final-send path (Telegram) must keep it on the editable format.
-        The original routing keys must pass through untouched.
-        """
+        """Metadata (containing thread_id) should be forwarded on first send."""
         adapter = _make_adapter()
         metadata = {"thread_id": "omt_topic789"}
         consumer = GatewayStreamConsumer(
@@ -109,9 +103,7 @@ class TestInitialReplyToId:
         await consumer._send_or_edit("Test")
 
         call_kwargs = adapter.send.call_args[1]
-        assert call_kwargs["metadata"] == {**metadata, "expect_edits": True}
-        # The consumer must not mutate the caller's metadata dict in place.
-        assert metadata == {"thread_id": "omt_topic789"}
+        assert call_kwargs["metadata"] == metadata
 
 
 class TestOverflowFirstMessage:

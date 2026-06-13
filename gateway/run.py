@@ -13745,16 +13745,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _cleanup_msg_ids.append(str(_flood_result.message_id))
                     else:
                         if can_edit:
-                            # First tool: send all accumulated text as new message.
-                            # This bubble is edited on every later tool event —
-                            # expect_edits keeps adapters with a rich send path
-                            # (Telegram) on the editable legacy format.
+                            # First tool: send all accumulated text as new message
                             full_text = "\n".join(progress_lines)
                             result = await adapter.send(
                                 chat_id=source.chat_id,
                                 content=full_text,
                                 reply_to=_progress_reply_to,
-                                metadata={**(_progress_metadata or {}), "expect_edits": True},
+                                metadata=_progress_metadata,
                             )
                         else:
                             # Editing unsupported: send just this line

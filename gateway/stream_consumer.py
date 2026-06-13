@@ -729,9 +729,6 @@ class GatewayStreamConsumer:
             return reply_to_id
         try:
             meta = dict(self.metadata) if self.metadata else {}
-            # This chunk becomes the next edit target — adapters that support
-            # rich final sends (Telegram) must keep it on the editable path.
-            meta["expect_edits"] = True
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
@@ -1387,16 +1384,12 @@ class GatewayStreamConsumer:
                     return False
             else:
                 # First message — send new, threaded to the original user message
-                # so it lands in the correct topic/thread. This preview frame is
-                # edited on every subsequent update, so mark it expect_edits:
-                # adapters with a rich final-send path (Telegram) must keep it
-                # on the editable legacy path or the first edit would flip the
-                # rendering format mid-stream.
+                # so it lands in the correct topic/thread.
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=text,
                     reply_to=self._initial_reply_to_id,
-                    metadata={**(self.metadata or {}), "expect_edits": True},
+                    metadata=self.metadata,
                 )
                 if result.success:
                     if result.message_id:
