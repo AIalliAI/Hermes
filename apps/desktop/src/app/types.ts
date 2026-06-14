@@ -46,6 +46,16 @@ export interface SlashExecResponse {
   warning?: string
 }
 
+export interface SessionCompressResponse {
+  removed?: number
+  summary?: {
+    headline?: string
+    noop?: boolean
+    note?: null | string
+    token_line?: string
+  }
+}
+
 export interface SessionSteerResponse {
   // 'queued' == accepted into the live turn's steer slot (injected at the next
   // tool-result boundary); 'rejected' == no live tool window, caller queues.
