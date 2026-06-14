@@ -12,6 +12,7 @@ exercised with synthetic ``Request`` objects.
 
 from __future__ import annotations
 
+import base64
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -48,6 +49,8 @@ def _make_adapter(**overrides):
     adapter._webhook_path = "/whatsapp/webhook"
     adapter._health_path = "/health"
     adapter._api_version = overrides.pop("api_version", "v20.0")
+    adapter._calling_sidecar_url = overrides.pop("calling_sidecar_url", "")
+    adapter._calling_sidecar_timeout = overrides.pop("calling_sidecar_timeout", 10.0)
     adapter._runner = None
     adapter._http_client = None
 
@@ -291,6 +294,527 @@ class TestSendText:
 
 
 # ---------------------------------------------------------------------------
+# WhatsApp Calling sidecar client
+# ---------------------------------------------------------------------------
+
+class TestCallingSidecarClient:
+    def test_init_reads_calling_sidecar_config_from_extra(self, monkeypatch):
+        from gateway.platforms.whatsapp_cloud import WhatsAppCloudAdapter
+
+        monkeypatch.delenv("WHATSAPP_CLOUD_CALLING_SIDECAR_URL", raising=False)
+        monkeypatch.delenv("WHATSAPP_CLOUD_CALLING_SIDECAR_TIMEOUT", raising=False)
+
+        config = MagicMock()
+        config.extra = {
+            "phone_number_id": "123",
+            "access_token": "tok",
+            "calling_sidecar_url": "http://127.0.0.1:8787/",
+            "calling_sidecar_timeout": "2.5",
+        }
+
+        adapter = WhatsAppCloudAdapter(config)
+
+        assert adapter._calling_sidecar_url == "http://127.0.0.1:8787"
+        assert adapter._calling_sidecar_timeout == 2.5
+        assert adapter._calling_sidecar_enabled() is True
+
+    def test_gateway_env_overrides_populate_calling_sidecar(self, monkeypatch):
+        from gateway.config import GatewayConfig, Platform, _apply_env_overrides
+
+        monkeypatch.setenv("WHATSAPP_CLOUD_PHONE_NUMBER_ID", "phone-123")
+        monkeypatch.setenv("WHATSAPP_CLOUD_ACCESS_TOKEN", "token-123")
+        monkeypatch.setenv(
+            "WHATSAPP_CLOUD_CALLING_SIDECAR_URL",
+            "http://127.0.0.1:8787",
+        )
+        monkeypatch.setenv("WHATSAPP_CLOUD_CALLING_SIDECAR_TIMEOUT", "4.25")
+
+        config = GatewayConfig()
+        _apply_env_overrides(config)
+
+        extra = config.platforms[Platform.WHATSAPP_CLOUD].extra
+        assert extra["phone_number_id"] == "phone-123"
+        assert extra["access_token"] == "token-123"
+        assert extra["calling_sidecar_url"] == "http://127.0.0.1:8787"
+        assert extra["calling_sidecar_timeout"] == 4.25
+
+    @pytest.mark.asyncio
+    async def test_disabled_without_url(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock()
+
+        answer = await adapter._request_calling_sidecar_answer("call-1", "v=0\r\n")
+
+        assert answer is None
+        adapter._http_client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_request_posts_offer_and_returns_answer(self):
+        adapter = _make_adapter(
+            calling_sidecar_url="http://127.0.0.1:8787",
+            calling_sidecar_timeout=2.5,
+        )
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(
+                200,
+                {
+                    "call_id": "call-1",
+                    "type": "answer",
+                    "sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+                    "audio": {
+                        "sample_rate": 48000,
+                        "channels": 1,
+                        "frame_ms": 20,
+                        "encoding": "pcm_s16le",
+                    },
+                },
+            )
+        )
+
+        answer = await adapter._request_calling_sidecar_answer("call-1", "v=0\r\n")
+
+        assert answer is not None
+        assert answer.call_id == "call-1"
+        assert answer.sdp.startswith("v=0")
+        assert answer.audio["encoding"] == "pcm_s16le"
+        adapter._http_client.post.assert_awaited_once()
+        call = adapter._http_client.post.call_args
+        assert call.args[0] == "http://127.0.0.1:8787/offer"
+        assert call.kwargs["timeout"] == 2.5
+        assert call.kwargs["json"] == {
+            "call_id": "call-1",
+            "type": "offer",
+            "sdp": "v=0\r\n",
+        }
+
+    @pytest.mark.asyncio
+    async def test_request_requires_connected_http_client(self):
+        adapter = _make_adapter(calling_sidecar_url="http://127.0.0.1:8787")
+
+        answer = await adapter._request_calling_sidecar_answer("call-1", "v=0\r\n")
+
+        assert answer is None
+
+    @pytest.mark.asyncio
+    async def test_request_rejects_non_200(self):
+        adapter = _make_adapter(calling_sidecar_url="http://127.0.0.1:8787")
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(503, {"error": "sidecar down"})
+        )
+
+        answer = await adapter._request_calling_sidecar_answer("call-1", "v=0\r\n")
+
+        assert answer is None
+
+    @pytest.mark.asyncio
+    async def test_request_fetches_machine_readable_contract(self):
+        adapter = _make_adapter(
+            calling_sidecar_url="http://127.0.0.1:8787",
+            calling_sidecar_timeout=2.5,
+        )
+        adapter._http_client = MagicMock()
+        adapter._http_client.get = AsyncMock(
+            return_value=_mock_httpx_response(
+                200,
+                {
+                    "contract": "voice.webrtc_sidecar",
+                    "version": 1,
+                    "audio": {
+                        "sample_rate": 48000,
+                        "channels": 1,
+                        "frame_ms": 20,
+                        "encoding": "pcm_s16le",
+                        "frame_bytes": 1920,
+                    },
+                },
+            )
+        )
+
+        contract = await adapter._request_calling_sidecar_contract()
+
+        assert contract is not None
+        assert contract["contract"] == "voice.webrtc_sidecar"
+        assert contract["audio"]["frame_bytes"] == 1920
+        assert contract["audio"]["default_drain_bytes"] == 96000
+        assert contract["audio"]["max_drain_wait_ms"] == 5000
+        assert contract["audio"]["max_outbound_queue_bytes"] == 960000
+        call = adapter._http_client.get.call_args
+        assert call.args[0] == "http://127.0.0.1:8787/contract"
+        assert call.kwargs["timeout"] == 2.5
+
+    @pytest.mark.asyncio
+    async def test_request_contract_tolerates_older_sidecar_404(self):
+        adapter = _make_adapter(calling_sidecar_url="http://127.0.0.1:8787")
+        adapter._http_client = MagicMock()
+        adapter._http_client.get = AsyncMock(
+            return_value=_mock_httpx_response(404, {"error": "not found"})
+        )
+
+        contract = await adapter._request_calling_sidecar_contract()
+
+        assert contract is None
+
+    @pytest.mark.asyncio
+    async def test_request_contract_rejects_mismatched_audio_shape(self):
+        adapter = _make_adapter(calling_sidecar_url="http://127.0.0.1:8787")
+        adapter._http_client = MagicMock()
+        adapter._http_client.get = AsyncMock(
+            return_value=_mock_httpx_response(
+                200,
+                {
+                    "contract": "voice.webrtc_sidecar",
+                    "version": 1,
+                    "audio": {
+                        "sample_rate": 16000,
+                        "channels": 1,
+                        "frame_ms": 20,
+                        "encoding": "pcm_s16le",
+                    },
+                },
+            )
+        )
+
+        contract = await adapter._request_calling_sidecar_contract()
+
+        assert contract is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", [
+        {"type": "offer", "sdp": "v=0"},
+        {"type": "answer"},
+        {"type": "answer", "sdp": ""},
+        ["not", "an", "object"],
+    ])
+    async def test_request_rejects_invalid_answer(self, body):
+        adapter = _make_adapter(calling_sidecar_url="http://127.0.0.1:8787")
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(200, body)
+        )
+
+        answer = await adapter._request_calling_sidecar_answer("call-1", "v=0\r\n")
+
+        assert answer is None
+
+    @pytest.mark.asyncio
+    async def test_request_rejects_mismatched_answer_audio_shape(self):
+        adapter = _make_adapter(calling_sidecar_url="http://127.0.0.1:8787")
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(
+                200,
+                {
+                    "call_id": "call-1",
+                    "type": "answer",
+                    "sdp": "v=0\r\n",
+                    "audio": {
+                        "sample_rate": 16000,
+                        "channels": 1,
+                        "frame_ms": 20,
+                        "encoding": "pcm_s16le",
+                    },
+                },
+            )
+        )
+
+        answer = await adapter._request_calling_sidecar_answer("call-1", "v=0\r\n")
+
+        assert answer is None
+
+    @pytest.mark.asyncio
+    async def test_send_call_action_posts_session_answer(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(200, {"success": True})
+        )
+
+        result = await adapter._send_call_action(
+            "wacid.call-1",
+            "pre_accept",
+            sdp="v=0\r\n",
+        )
+
+        assert result.success is True
+        call = adapter._http_client.post.call_args
+        assert call.args[0] == "https://graph.facebook.com/v20.0/1234567890/calls"
+        assert call.kwargs["headers"]["Authorization"] == "Bearer test-token"
+        assert call.kwargs["json"] == {
+            "messaging_product": "whatsapp",
+            "call_id": "wacid.call-1",
+            "action": "pre_accept",
+            "session": {
+                "sdp_type": "answer",
+                "sdp": "v=0\r\n",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_send_call_action_returns_graph_error(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(
+                400,
+                {
+                    "error": {
+                        "code": 100,
+                        "message": "Invalid call id",
+                    }
+                },
+            )
+        )
+
+        result = await adapter._send_call_action("bad-call", "accept", sdp="v=0\r\n")
+
+        assert result.success is False
+        assert "graph error 100" in result.error
+
+    @pytest.mark.asyncio
+    async def test_send_calling_sidecar_audio_posts_pcm_payload(self):
+        adapter = _make_adapter(
+            calling_sidecar_url="http://127.0.0.1:8787",
+            calling_sidecar_timeout=2.5,
+        )
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(
+                200,
+                {"accepted_bytes": 4, "queued_tx_bytes": 4},
+            )
+        )
+
+        result = await adapter._send_calling_sidecar_audio(
+            "wacid.call/with/slash",
+            b"\x01\x00\xff\xff",
+            sequence=17,
+        )
+
+        assert result.success is True
+        assert result.raw_response == {"accepted_bytes": 4, "queued_tx_bytes": 4}
+        call = adapter._http_client.post.call_args
+        assert call.args[0] == (
+            "http://127.0.0.1:8787/calls/wacid.call%2Fwith%2Fslash/audio"
+        )
+        assert call.kwargs["timeout"] == 2.5
+        assert call.kwargs["json"] == {
+            "sequence": 17,
+            "sample_rate": 48000,
+            "channels": 1,
+            "frame_ms": 20,
+            "encoding": "pcm_s16le",
+            "pcm_s16le_base64": base64.b64encode(b"\x01\x00\xff\xff").decode("ascii"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_send_calling_sidecar_audio_requires_sidecar(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock()
+
+        result = await adapter._send_calling_sidecar_audio("call-1", b"\x00\x00")
+
+        assert result.success is False
+        assert result.error == "Calling sidecar not configured"
+        adapter._http_client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_calling_sidecar_audio_returns_sidecar_error(self):
+        adapter = _make_adapter(calling_sidecar_url="http://127.0.0.1:8787")
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(
+                400,
+                {"error": "sample_rate must be 48000"},
+            )
+        )
+
+        result = await adapter._send_calling_sidecar_audio("call-1", b"\x00\x00")
+
+        assert result.success is False
+        assert result.error == "sample_rate must be 48000"
+        assert result.raw_response == {"error": "sample_rate must be 48000"}
+        assert result.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_send_calling_sidecar_audio_treats_429_as_backpressure(self):
+        adapter = _make_adapter(calling_sidecar_url="http://127.0.0.1:8787")
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(
+                429,
+                {"error": "outbound PCM queue is full"},
+            )
+        )
+
+        result = await adapter._send_calling_sidecar_audio("call-1", b"\x00\x00")
+
+        assert result.success is False
+        assert result.error == "outbound PCM queue is full"
+        assert result.raw_response == {"error": "outbound PCM queue is full"}
+        assert result.retryable is True
+
+    @pytest.mark.asyncio
+    async def test_receive_calling_sidecar_audio_drains_pcm_payload(self):
+        adapter = _make_adapter(
+            calling_sidecar_url="http://127.0.0.1:8787",
+            calling_sidecar_timeout=2.5,
+        )
+        adapter._http_client = MagicMock()
+        adapter._http_client.get = AsyncMock(
+            return_value=_mock_httpx_response(
+                200,
+                {
+                    "call_id": "wacid.call/with/slash",
+                    "returned_bytes": 4,
+                    "queued_rx_bytes": 8,
+                    "pcm_s16le_base64": base64.b64encode(
+                        b"\x01\x00\xff\xff"
+                    ).decode("ascii"),
+                    "audio": {
+                        "sample_rate": 48000,
+                        "channels": 1,
+                        "frame_ms": 20,
+                        "encoding": "pcm_s16le",
+                    },
+                },
+            )
+        )
+
+        audio = await adapter._receive_calling_sidecar_audio(
+            "wacid.call/with/slash",
+            max_bytes=4,
+        )
+
+        assert audio is not None
+        assert audio.call_id == "wacid.call/with/slash"
+        assert audio.pcm_s16le == b"\x01\x00\xff\xff"
+        assert audio.returned_bytes == 4
+        assert audio.queued_rx_bytes == 8
+        assert audio.audio["encoding"] == "pcm_s16le"
+        call = adapter._http_client.get.call_args
+        assert call.args[0] == (
+            "http://127.0.0.1:8787/calls/wacid.call%2Fwith%2Fslash/audio"
+        )
+        assert call.kwargs["params"] == {"max_bytes": 4, "wait_ms": 500}
+        assert call.kwargs["timeout"] == 2.5
+
+    @pytest.mark.asyncio
+    async def test_receive_calling_sidecar_audio_defaults_to_contract_window(self):
+        adapter = _make_adapter(calling_sidecar_url="http://127.0.0.1:8787")
+        adapter._http_client = MagicMock()
+        adapter._http_client.get = AsyncMock(
+            return_value=_mock_httpx_response(
+                200,
+                {
+                    "returned_bytes": 0,
+                    "queued_rx_bytes": 0,
+                    "pcm_s16le_base64": "",
+                    "audio": {
+                        "sample_rate": 48000,
+                        "channels": 1,
+                        "frame_ms": 20,
+                        "encoding": "pcm_s16le",
+                    },
+                },
+            )
+        )
+
+        audio = await adapter._receive_calling_sidecar_audio("call-1")
+
+        assert audio is not None
+        call = adapter._http_client.get.call_args
+        assert call.kwargs["params"] == {"max_bytes": 96000, "wait_ms": 500}
+
+    @pytest.mark.asyncio
+    async def test_receive_calling_sidecar_audio_requires_sidecar(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.get = AsyncMock()
+
+        audio = await adapter._receive_calling_sidecar_audio("call-1")
+
+        assert audio is None
+        adapter._http_client.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_receive_calling_sidecar_audio_rejects_partial_sample_request(self):
+        adapter = _make_adapter(calling_sidecar_url="http://127.0.0.1:8787")
+        adapter._http_client = MagicMock()
+        adapter._http_client.get = AsyncMock()
+
+        audio = await adapter._receive_calling_sidecar_audio("call-1", max_bytes=1)
+
+        assert audio is None
+        adapter._http_client.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_receive_calling_sidecar_audio_rejects_negative_wait(self):
+        adapter = _make_adapter(calling_sidecar_url="http://127.0.0.1:8787")
+        adapter._http_client = MagicMock()
+        adapter._http_client.get = AsyncMock()
+
+        audio = await adapter._receive_calling_sidecar_audio("call-1", wait_ms=-1)
+
+        assert audio is None
+        adapter._http_client.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_receive_calling_sidecar_audio_rejects_bad_sidecar_payload(self):
+        adapter = _make_adapter(calling_sidecar_url="http://127.0.0.1:8787")
+        adapter._http_client = MagicMock()
+        adapter._http_client.get = AsyncMock(
+            return_value=_mock_httpx_response(
+                200,
+                {
+                    "returned_bytes": 99,
+                    "queued_rx_bytes": 0,
+                    "pcm_s16le_base64": base64.b64encode(b"\x00\x00").decode("ascii"),
+                },
+            )
+        )
+
+        audio = await adapter._receive_calling_sidecar_audio("call-1")
+
+        assert audio is None
+
+    @pytest.mark.asyncio
+    async def test_close_calling_sidecar_session_posts_close(self):
+        adapter = _make_adapter(
+            calling_sidecar_url="http://127.0.0.1:8787",
+            calling_sidecar_timeout=2.5,
+        )
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(200, {"closed": True})
+        )
+
+        closed = await adapter._close_calling_sidecar_session("wacid.call/with/slash")
+
+        assert closed is True
+        call = adapter._http_client.post.call_args
+        assert call.args[0] == (
+            "http://127.0.0.1:8787/calls/wacid.call%2Fwith%2Fslash/close"
+        )
+        assert call.kwargs["timeout"] == 2.5
+
+    @pytest.mark.asyncio
+    async def test_close_calling_sidecar_session_treats_404_as_closed(self):
+        adapter = _make_adapter(calling_sidecar_url="http://127.0.0.1:8787")
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(404, {"error": "unknown call_id"})
+        )
+
+        closed = await adapter._close_calling_sidecar_session("wacid.missing")
+
+        assert closed is True
+
+
+# ---------------------------------------------------------------------------
 # Inbound webhook verify (GET) handshake
 # ---------------------------------------------------------------------------
 
@@ -428,6 +952,84 @@ _SAMPLE_INBOUND_TEXT_PAYLOAD = {
                                 "timestamp": "1758254144",
                                 "text": {"body": "Hi!"},
                                 "type": "text",
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    ],
+}
+
+
+_SAMPLE_CALL_CONNECT_PAYLOAD = {
+    "object": "whatsapp_business_account",
+    "entry": [
+        {
+            "id": "215589313241560883",
+            "changes": [
+                {
+                    "field": "calls",
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "metadata": {
+                            "display_phone_number": "15551797781",
+                            "phone_number_id": "7794189252778687",
+                        },
+                        "contacts": [
+                            {
+                                "profile": {"name": "Jessica Laverdetman"},
+                                "wa_id": "13557825698",
+                            }
+                        ],
+                        "calls": [
+                            {
+                                "id": "wacid.ABGGFjFVU2AfAgo6V-Hc5eCgK5Gh",
+                                "from": "13557825698",
+                                "to": "15551797781",
+                                "event": "connect",
+                                "timestamp": "1762216151",
+                                "direction": "USER_INITIATED",
+                                "session": {
+                                    "sdp_type": "offer",
+                                    "sdp": (
+                                        "v=0\r\n"
+                                        "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    ],
+}
+
+
+_SAMPLE_CALL_TERMINATE_PAYLOAD = {
+    "object": "whatsapp_business_account",
+    "entry": [
+        {
+            "id": "215589313241560883",
+            "changes": [
+                {
+                    "field": "calls",
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "metadata": {
+                            "display_phone_number": "15551797781",
+                            "phone_number_id": "7794189252778687",
+                        },
+                        "calls": [
+                            {
+                                "id": "wacid.ABGGFjFVU2AfAgo6V-Hc5eCgK5Gh",
+                                "from": "13557825698",
+                                "to": "15551797781",
+                                "event": "terminate",
+                                "timestamp": "1762216199",
+                                "direction": "USER_INITIATED",
+                                "status": "COMPLETED",
                             }
                         ],
                     },
@@ -690,6 +1292,166 @@ class TestWebhookDispatch:
         adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_call_connect_without_sidecar_does_not_dispatch_message(self):
+        adapter = _make_adapter(app_secret="key")
+        adapter.handle_message = AsyncMock()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock()
+        body = json.dumps(_SAMPLE_CALL_CONNECT_PAYLOAD).encode("utf-8")
+        sig = _sign("key", body)
+
+        response = await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": sig})
+        )
+
+        assert response.status == 200
+        adapter.handle_message.assert_not_called()
+        adapter._http_client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_call_connect_routes_offer_to_sidecar_and_accepts(self):
+        adapter = _make_adapter(
+            app_secret="key",
+            calling_sidecar_url="http://127.0.0.1:8787",
+        )
+        adapter.handle_message = AsyncMock()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(side_effect=[
+            _mock_httpx_response(
+                200,
+                {
+                    "call_id": "wacid.ABGGFjFVU2AfAgo6V-Hc5eCgK5Gh",
+                    "type": "answer",
+                    "sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+                    "audio": {
+                        "sample_rate": 48000,
+                        "channels": 1,
+                        "frame_ms": 20,
+                        "encoding": "pcm_s16le",
+                    },
+                },
+            ),
+            _mock_httpx_response(200, {"success": True}),
+            _mock_httpx_response(200, {"success": True}),
+        ])
+        body = json.dumps(_SAMPLE_CALL_CONNECT_PAYLOAD).encode("utf-8")
+        sig = _sign("key", body)
+
+        response = await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": sig})
+        )
+
+        assert response.status == 200
+        adapter.handle_message.assert_not_called()
+        assert adapter._http_client.post.call_count == 3
+
+        sidecar_call = adapter._http_client.post.call_args_list[0]
+        assert sidecar_call.args[0] == "http://127.0.0.1:8787/offer"
+        assert sidecar_call.kwargs["json"] == {
+            "call_id": "wacid.ABGGFjFVU2AfAgo6V-Hc5eCgK5Gh",
+            "type": "offer",
+            "sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+        }
+
+        pre_accept_call = adapter._http_client.post.call_args_list[1]
+        accept_call = adapter._http_client.post.call_args_list[2]
+        assert pre_accept_call.args[0].endswith("/calls")
+        assert accept_call.args[0].endswith("/calls")
+        assert pre_accept_call.kwargs["json"]["action"] == "pre_accept"
+        assert accept_call.kwargs["json"]["action"] == "accept"
+        assert pre_accept_call.kwargs["json"]["session"] == {
+            "sdp_type": "answer",
+            "sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+        }
+        assert accept_call.kwargs["json"]["session"] == {
+            "sdp_type": "answer",
+            "sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+        }
+
+    @pytest.mark.asyncio
+    async def test_call_connect_sidecar_failure_skips_graph_accept(self):
+        adapter = _make_adapter(
+            app_secret="key",
+            calling_sidecar_url="http://127.0.0.1:8787",
+        )
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(503, {"error": "down"})
+        )
+        body = json.dumps(_SAMPLE_CALL_CONNECT_PAYLOAD).encode("utf-8")
+        sig = _sign("key", body)
+
+        response = await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": sig})
+        )
+
+        assert response.status == 200
+        assert adapter._http_client.post.call_count == 1
+        assert adapter._http_client.post.call_args.args[0].endswith("/offer")
+
+    @pytest.mark.asyncio
+    async def test_call_connect_malformed_offer_skips_sidecar(self):
+        adapter = _make_adapter(
+            app_secret="key",
+            calling_sidecar_url="http://127.0.0.1:8787",
+        )
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock()
+        payload = json.loads(json.dumps(_SAMPLE_CALL_CONNECT_PAYLOAD))
+        session = payload["entry"][0]["changes"][0]["value"]["calls"][0]["session"]
+        session["sdp_type"] = "answer"
+        body = json.dumps(payload).encode("utf-8")
+        sig = _sign("key", body)
+
+        response = await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": sig})
+        )
+
+        assert response.status == 200
+        adapter._http_client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_call_terminate_closes_sidecar_session(self):
+        adapter = _make_adapter(
+            app_secret="key",
+            calling_sidecar_url="http://127.0.0.1:8787",
+        )
+        adapter.handle_message = AsyncMock()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(200, {"closed": True})
+        )
+        body = json.dumps(_SAMPLE_CALL_TERMINATE_PAYLOAD).encode("utf-8")
+        sig = _sign("key", body)
+
+        response = await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": sig})
+        )
+
+        assert response.status == 200
+        adapter.handle_message.assert_not_called()
+        adapter._http_client.post.assert_awaited_once()
+        assert adapter._http_client.post.call_args.args[0] == (
+            "http://127.0.0.1:8787/calls/"
+            "wacid.ABGGFjFVU2AfAgo6V-Hc5eCgK5Gh/close"
+        )
+
+    @pytest.mark.asyncio
+    async def test_call_terminate_without_sidecar_skips_http(self):
+        adapter = _make_adapter(app_secret="key")
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock()
+        body = json.dumps(_SAMPLE_CALL_TERMINATE_PAYLOAD).encode("utf-8")
+        sig = _sign("key", body)
+
+        response = await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": sig})
+        )
+
+        assert response.status == 200
+        adapter._http_client.post.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_dispatch_handles_button_reply(self):
         adapter = _make_adapter(app_secret="key")
         captured = []
@@ -803,6 +1565,7 @@ class TestHealth:
         assert body["phone_number_id"] == "555"
         assert body["verify_token_configured"] is True
         assert body["app_secret_configured"] is True
+        assert body["calling_sidecar_configured"] is False
         assert body["accepted"] == 0
         assert body["duplicates"] == 0
         assert body["rejected_signature"] == 0

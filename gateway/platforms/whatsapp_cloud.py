@@ -37,11 +37,15 @@ Optional / Phase-3+:
 - WHATSAPP_CLOUD_WEBHOOK_PORT     (default 8090)
 - WHATSAPP_CLOUD_WEBHOOK_PATH     (default /whatsapp/webhook)
 - WHATSAPP_CLOUD_API_VERSION      (default v20.0)
+- WHATSAPP_CLOUD_CALLING_SIDECAR_URL      (optional WebRTC SDP bridge)
+- WHATSAPP_CLOUD_CALLING_SIDECAR_TIMEOUT  (default 10.0 seconds)
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import logging
@@ -51,8 +55,10 @@ import re
 import shutil
 import uuid
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import quote
 
 try:
     from aiohttp import web
@@ -88,6 +94,39 @@ DEFAULT_API_VERSION = "v20.0"
 DEFAULT_WEBHOOK_HOST = "0.0.0.0"
 DEFAULT_WEBHOOK_PORT = 8090
 DEFAULT_WEBHOOK_PATH = "/whatsapp/webhook"
+DEFAULT_CALLING_SIDECAR_TIMEOUT = 10.0
+CALLING_PCM_SAMPLE_RATE = 48_000
+CALLING_PCM_CHANNELS = 1
+CALLING_PCM_FRAME_MS = 20
+CALLING_PCM_BYTES_PER_SAMPLE = 2
+CALLING_PCM_FRAME_BYTES = (
+    CALLING_PCM_SAMPLE_RATE
+    * CALLING_PCM_CHANNELS
+    * CALLING_PCM_BYTES_PER_SAMPLE
+    * CALLING_PCM_FRAME_MS
+    // 1_000
+)
+CALLING_PCM_DEFAULT_DRAIN_BYTES = (
+    CALLING_PCM_SAMPLE_RATE * CALLING_PCM_CHANNELS * CALLING_PCM_BYTES_PER_SAMPLE
+)
+CALLING_PCM_DRAIN_WAIT_MS = 500
+CALLING_PCM_MAX_DRAIN_WAIT_MS = 5_000
+CALLING_PCM_MAX_OUTBOUND_QUEUE_BYTES = (
+    CALLING_PCM_SAMPLE_RATE * CALLING_PCM_CHANNELS * CALLING_PCM_BYTES_PER_SAMPLE * 10
+)
+CALLING_PCM_ENCODING = "pcm_s16le"
+CALLING_AUDIO_CONTRACT = {
+    "sample_rate": CALLING_PCM_SAMPLE_RATE,
+    "channels": CALLING_PCM_CHANNELS,
+    "frame_ms": CALLING_PCM_FRAME_MS,
+    "encoding": CALLING_PCM_ENCODING,
+    "bytes_per_sample": CALLING_PCM_BYTES_PER_SAMPLE,
+    "samples_per_frame": CALLING_PCM_SAMPLE_RATE * CALLING_PCM_FRAME_MS // 1_000,
+    "frame_bytes": CALLING_PCM_FRAME_BYTES,
+    "default_drain_bytes": CALLING_PCM_DEFAULT_DRAIN_BYTES,
+    "max_drain_wait_ms": CALLING_PCM_MAX_DRAIN_WAIT_MS,
+    "max_outbound_queue_bytes": CALLING_PCM_MAX_OUTBOUND_QUEUE_BYTES,
+}
 GRAPH_API_BASE = "https://graph.facebook.com"
 # Meta retries failed webhooks for up to 7 days. We don't need to remember
 # every wamid for the full retry window — the practical risk is duplicate
@@ -160,9 +199,66 @@ def _ext_for_mime(mime: str) -> Optional[str]:
     return mimetypes.guess_extension(primary) or None
 
 
+def _matches_calling_audio_contract(audio: Any) -> bool:
+    """Return whether a sidecar audio object matches Hermes' PCM frame shape."""
+    if not isinstance(audio, dict):
+        return False
+    try:
+        sample_rate = int(audio.get("sample_rate"))
+        channels = int(audio.get("channels"))
+        frame_ms = int(audio.get("frame_ms"))
+    except (TypeError, ValueError):
+        return False
+    encoding = str(audio.get("encoding") or "").strip().lower()
+    return (
+        sample_rate == CALLING_PCM_SAMPLE_RATE
+        and channels == CALLING_PCM_CHANNELS
+        and frame_ms == CALLING_PCM_FRAME_MS
+        and encoding == CALLING_PCM_ENCODING
+    )
+
+
+def _normalize_calling_audio_contract(audio: Dict[str, Any]) -> Dict[str, Any]:
+    """Fill optional sidecar contract fields with Hermes' local defaults."""
+    normalized = dict(audio)
+    normalized.setdefault("bytes_per_sample", CALLING_PCM_BYTES_PER_SAMPLE)
+    normalized.setdefault(
+        "samples_per_frame",
+        CALLING_PCM_SAMPLE_RATE * CALLING_PCM_FRAME_MS // 1_000,
+    )
+    normalized.setdefault("frame_bytes", CALLING_PCM_FRAME_BYTES)
+    normalized.setdefault("default_drain_bytes", CALLING_PCM_DEFAULT_DRAIN_BYTES)
+    normalized.setdefault("max_drain_wait_ms", CALLING_PCM_MAX_DRAIN_WAIT_MS)
+    normalized.setdefault(
+        "max_outbound_queue_bytes",
+        CALLING_PCM_MAX_OUTBOUND_QUEUE_BYTES,
+    )
+    return normalized
+
+
 # Inbound media cache lives under the user's hermes dir so it survives
 # restarts and gateway reloads — same convention the Baileys bridge uses.
 _INBOUND_MEDIA_CACHE = Path(get_hermes_dir("platforms/whatsapp_cloud/media", "whatsapp_cloud/media"))
+
+
+@dataclass(frozen=True)
+class CallingSidecarAnswer:
+    """Validated SDP answer returned by the local WhatsApp Calling sidecar."""
+
+    call_id: str
+    sdp: str
+    audio: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class CallingSidecarAudio:
+    """Decoded inbound PCM drained from the local WhatsApp Calling sidecar."""
+
+    call_id: str
+    pcm_s16le: bytes
+    returned_bytes: int
+    queued_rx_bytes: int
+    audio: Dict[str, Any]
 
 
 def check_whatsapp_cloud_requirements() -> bool:
@@ -214,13 +310,27 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # Graph API
         self._api_version: str = str(extra.get("api_version", DEFAULT_API_VERSION))
 
+        # Optional WhatsApp Calling/WebRTC sidecar. This is intentionally
+        # separate from Graph API calls: the sidecar owns SDP/media bridging
+        # while the Cloud adapter remains the webhook/session boundary.
+        self._calling_sidecar_url: str = str(
+            extra.get("calling_sidecar_url")
+            or extra.get("callingSidecarUrl")
+            or os.getenv("WHATSAPP_CLOUD_CALLING_SIDECAR_URL")
+            or ""
+        ).strip().rstrip("/")
+        self._calling_sidecar_timeout: float = self._coerce_positive_float(
+            extra.get("calling_sidecar_timeout")
+            or extra.get("callingSidecarTimeout")
+            or os.getenv("WHATSAPP_CLOUD_CALLING_SIDECAR_TIMEOUT"),
+            DEFAULT_CALLING_SIDECAR_TIMEOUT,
+        )
+
         # Behavior-mixin contract: these names are read by the mixin's
         # gating methods. WHATSAPP_CLOUD_* env vars take precedence so the
         # two adapters can run in parallel with independent policies; the
         # shared WHATSAPP_* names remain as fallback for single-adapter
         # setups.
-        import os
-
         self._reply_prefix: Optional[str] = extra.get("reply_prefix")
         self._dm_policy: str = str(
             extra.get("dm_policy")
@@ -302,6 +412,492 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if path.startswith("/"):
             path = path[1:]
         return f"{GRAPH_API_BASE}/{self._api_version}/{self._phone_number_id}/{path}"
+
+    @staticmethod
+    def _coerce_positive_float(value: Any, default: float) -> float:
+        if value is None:
+            return default
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
+
+    def _calling_sidecar_enabled(self) -> bool:
+        return bool(self._calling_sidecar_url)
+
+    async def _request_calling_sidecar_contract(self) -> Optional[Dict[str, Any]]:
+        """Fetch and validate the local sidecar's optional machine contract."""
+        if not self._calling_sidecar_enabled():
+            return None
+        if self._http_client is None:
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar configured but HTTP client "
+                "is unavailable"
+            )
+            return None
+
+        url = f"{self._calling_sidecar_url}/contract"
+        try:
+            resp = await self._http_client.get(
+                url,
+                timeout=self._calling_sidecar_timeout,
+            )
+        except Exception:
+            logger.exception("[whatsapp_cloud] calling sidecar contract request failed")
+            return None
+
+        if resp.status_code == 404:
+            logger.debug(
+                "[whatsapp_cloud] calling sidecar does not expose /contract yet"
+            )
+            return None
+        if resp.status_code != 200:
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar contract request failed "
+                "(status=%d): %s",
+                resp.status_code,
+                str(getattr(resp, "text", ""))[:500],
+            )
+            return None
+
+        try:
+            data = resp.json()
+        except Exception:
+            logger.warning("[whatsapp_cloud] calling sidecar contract returned invalid JSON")
+            return None
+        if not isinstance(data, dict):
+            logger.warning("[whatsapp_cloud] calling sidecar contract is not an object")
+            return None
+        if data.get("contract") != "voice.webrtc_sidecar":
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar contract id was %r",
+                data.get("contract"),
+            )
+            return None
+        try:
+            version = int(data.get("version") or 0)
+        except (TypeError, ValueError):
+            version = 0
+        if version < 1:
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar contract version is invalid: %r",
+                data.get("version"),
+            )
+            return None
+        if not _matches_calling_audio_contract(data.get("audio")):
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar audio contract does not match "
+                "Hermes PCM settings"
+            )
+            return None
+        data = dict(data)
+        data["audio"] = _normalize_calling_audio_contract(data["audio"])
+        return data
+
+    async def _request_calling_sidecar_answer(
+        self,
+        call_id: str,
+        remote_sdp: str,
+    ) -> Optional[CallingSidecarAnswer]:
+        """Ask the configured local WebRTC sidecar for an SDP answer.
+
+        The sidecar contract mirrors the voice repo's prototype:
+        POST /offer with {"call_id", "type": "offer", "sdp"} and expect
+        {"type": "answer", "sdp": "...", "audio": {...}}. Full Meta
+        Calling webhook handling can call this once it has extracted the
+        inbound offer.
+        """
+        if not self._calling_sidecar_enabled():
+            return None
+        if self._http_client is None:
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar configured but HTTP client "
+                "is unavailable"
+            )
+            return None
+
+        normalized_call_id = str(call_id or "").strip()
+        remote_sdp_text = str(remote_sdp or "")
+        if not normalized_call_id or not remote_sdp_text.strip():
+            logger.warning(
+                "[whatsapp_cloud] refusing calling sidecar request with empty "
+                "call_id or sdp"
+            )
+            return None
+
+        url = f"{self._calling_sidecar_url}/offer"
+        payload = {
+            "call_id": normalized_call_id,
+            "type": "offer",
+            "sdp": remote_sdp_text,
+        }
+        try:
+            resp = await self._http_client.post(
+                url,
+                json=payload,
+                timeout=self._calling_sidecar_timeout,
+            )
+        except Exception:
+            logger.exception("[whatsapp_cloud] calling sidecar offer request failed")
+            return None
+
+        if resp.status_code != 200:
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar rejected offer "
+                "(status=%d): %s",
+                resp.status_code,
+                str(getattr(resp, "text", ""))[:500],
+            )
+            return None
+
+        try:
+            data = resp.json()
+        except Exception:
+            logger.warning("[whatsapp_cloud] calling sidecar returned invalid JSON")
+            return None
+
+        if not isinstance(data, dict):
+            logger.warning("[whatsapp_cloud] calling sidecar response is not an object")
+            return None
+        if data.get("type") != "answer":
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar response type was %r, not 'answer'",
+                data.get("type"),
+            )
+            return None
+
+        sdp = str(data.get("sdp") or "")
+        if not sdp.strip():
+            logger.warning("[whatsapp_cloud] calling sidecar answer missing sdp")
+            return None
+
+        audio = data.get("audio")
+        if not _matches_calling_audio_contract(audio):
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar answer audio contract does not "
+                "match Hermes PCM settings"
+            )
+            return None
+
+        answer_call_id = str(data.get("call_id") or "").strip() or normalized_call_id
+        return CallingSidecarAnswer(
+            call_id=answer_call_id,
+            sdp=sdp,
+            audio=audio,
+        )
+
+    async def _send_calling_sidecar_audio(
+        self,
+        call_id: str,
+        pcm_s16le: bytes,
+        *,
+        sequence: Optional[int] = None,
+    ) -> SendResult:
+        """Queue outbound 48 kHz 20 ms PCM for a local WebRTC sidecar call."""
+        if not self._calling_sidecar_enabled():
+            return SendResult(success=False, error="Calling sidecar not configured")
+        if self._http_client is None:
+            return SendResult(success=False, error="Not connected")
+
+        normalized_call_id = str(call_id or "").strip()
+        if not normalized_call_id:
+            return SendResult(success=False, error="Missing call_id")
+        if not isinstance(pcm_s16le, (bytes, bytearray, memoryview)):
+            return SendResult(success=False, error="PCM payload must be bytes")
+
+        pcm_bytes = bytes(pcm_s16le)
+        if not pcm_bytes:
+            return SendResult(success=False, error="PCM payload is empty")
+        if len(pcm_bytes) % 2:
+            return SendResult(
+                success=False,
+                error="PCM payload must contain whole s16le samples",
+            )
+
+        encoded_call_id = quote(normalized_call_id, safe="")
+        url = f"{self._calling_sidecar_url}/calls/{encoded_call_id}/audio"
+        payload: Dict[str, Any] = {
+            "sample_rate": CALLING_PCM_SAMPLE_RATE,
+            "channels": CALLING_PCM_CHANNELS,
+            "frame_ms": CALLING_PCM_FRAME_MS,
+            "encoding": CALLING_PCM_ENCODING,
+            "pcm_s16le_base64": base64.b64encode(pcm_bytes).decode("ascii"),
+        }
+        if sequence is not None:
+            payload["sequence"] = sequence
+
+        try:
+            resp = await self._http_client.post(
+                url,
+                json=payload,
+                timeout=self._calling_sidecar_timeout,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[whatsapp_cloud] calling sidecar audio request failed for %s",
+                normalized_call_id,
+            )
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw": str(getattr(resp, "text", ""))[:500]}
+
+        if resp.status_code != 200:
+            error_msg = ""
+            if isinstance(body, dict):
+                error_msg = str(body.get("error") or "")
+            if not error_msg:
+                if resp.status_code == 429:
+                    error_msg = "calling sidecar audio backpressure"
+                else:
+                    error_msg = (
+                        f"calling sidecar audio failed with HTTP {resp.status_code}"
+                    )
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar audio rejected "
+                "(status=%d): %s",
+                resp.status_code,
+                error_msg,
+            )
+            return SendResult(
+                success=False,
+                error=error_msg,
+                raw_response=body,
+                retryable=resp.status_code == 429,
+            )
+
+        return SendResult(success=True, raw_response=body)
+
+    async def _receive_calling_sidecar_audio(
+        self,
+        call_id: str,
+        *,
+        max_bytes: int = CALLING_PCM_DEFAULT_DRAIN_BYTES,
+        wait_ms: int = CALLING_PCM_DRAIN_WAIT_MS,
+    ) -> Optional[CallingSidecarAudio]:
+        """Drain decoded inbound 48 kHz PCM from a local WebRTC sidecar call."""
+        if not self._calling_sidecar_enabled():
+            return None
+        if self._http_client is None:
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar configured but HTTP client "
+                "is unavailable"
+            )
+            return None
+
+        normalized_call_id = str(call_id or "").strip()
+        if not normalized_call_id:
+            return None
+        if not isinstance(max_bytes, int) or max_bytes <= 0:
+            logger.warning(
+                "[whatsapp_cloud] invalid sidecar audio max_bytes=%r",
+                max_bytes,
+            )
+            return None
+        if max_bytes % CALLING_PCM_BYTES_PER_SAMPLE:
+            logger.warning(
+                "[whatsapp_cloud] sidecar audio max_bytes must preserve s16le samples"
+            )
+            return None
+        if not isinstance(wait_ms, int) or wait_ms < 0:
+            logger.warning("[whatsapp_cloud] invalid sidecar audio wait_ms=%r", wait_ms)
+            return None
+
+        encoded_call_id = quote(normalized_call_id, safe="")
+        url = f"{self._calling_sidecar_url}/calls/{encoded_call_id}/audio"
+        try:
+            resp = await self._http_client.get(
+                url,
+                params={"max_bytes": max_bytes, "wait_ms": wait_ms},
+                timeout=self._calling_sidecar_timeout,
+            )
+        except Exception:
+            logger.exception(
+                "[whatsapp_cloud] calling sidecar audio drain failed for %s",
+                normalized_call_id,
+            )
+            return None
+
+        if resp.status_code != 200:
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar audio drain rejected "
+                "(status=%d): %s",
+                resp.status_code,
+                str(getattr(resp, "text", ""))[:500],
+            )
+            return None
+
+        try:
+            data = resp.json()
+        except Exception:
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar audio drain returned invalid JSON"
+            )
+            return None
+        if not isinstance(data, dict):
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar audio drain response is not an object"
+            )
+            return None
+
+        try:
+            pcm = base64.b64decode(
+                str(data.get("pcm_s16le_base64") or ""),
+                validate=True,
+            )
+        except (binascii.Error, ValueError):
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar audio drain had invalid base64"
+            )
+            return None
+
+        try:
+            returned_bytes = int(data.get("returned_bytes") or 0)
+            queued_rx_bytes = int(data.get("queued_rx_bytes") or 0)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar audio drain had invalid byte counts"
+            )
+            return None
+        if returned_bytes != len(pcm):
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar audio drain byte count mismatch "
+                "(reported=%d, decoded=%d)",
+                returned_bytes,
+                len(pcm),
+            )
+            return None
+        if len(pcm) % CALLING_PCM_BYTES_PER_SAMPLE:
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar audio drain returned partial s16le sample"
+            )
+            return None
+
+        audio = data.get("audio")
+        if not _matches_calling_audio_contract(audio):
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar audio drain contract does not "
+                "match Hermes PCM settings"
+            )
+            return None
+
+        answer_call_id = str(data.get("call_id") or "").strip() or normalized_call_id
+        return CallingSidecarAudio(
+            call_id=answer_call_id,
+            pcm_s16le=pcm,
+            returned_bytes=returned_bytes,
+            queued_rx_bytes=queued_rx_bytes,
+            audio=audio,
+        )
+
+    async def _send_call_action(
+        self,
+        call_id: str,
+        action: str,
+        *,
+        sdp: Optional[str] = None,
+    ) -> SendResult:
+        """Send a WhatsApp Calling action to Graph API.
+
+        ``pre_accept`` and ``accept`` require an SDP answer session; ``reject``
+        and ``terminate`` do not.
+        """
+        if self._http_client is None:
+            return SendResult(success=False, error="Not connected")
+
+        normalized_call_id = str(call_id or "").strip()
+        normalized_action = str(action or "").strip()
+        if not normalized_call_id or not normalized_action:
+            return SendResult(success=False, error="Missing call_id or action")
+
+        payload: Dict[str, Any] = {
+            "messaging_product": "whatsapp",
+            "call_id": normalized_call_id,
+            "action": normalized_action,
+        }
+        if sdp is not None:
+            sdp_text = str(sdp)
+            if not sdp_text.strip():
+                return SendResult(success=False, error="Missing SDP answer")
+            payload["session"] = {
+                "sdp_type": "answer",
+                "sdp": sdp_text,
+            }
+
+        url = self._graph_url("calls")
+        headers = {
+            "Authorization": f"Bearer {self._access_token}",
+            "Content-Type": "application/json",
+        }
+        try:
+            resp = await self._http_client.post(url, headers=headers, json=payload)
+        except Exception as exc:
+            logger.exception("[whatsapp_cloud] call action %s failed", normalized_action)
+            return SendResult(success=False, error=str(exc))
+
+        if resp.status_code != 200:
+            try:
+                body = resp.json()
+            except Exception:
+                body = {"raw": resp.text[:500]}
+            error_msg = self._format_graph_error(body, resp.status_code)
+            logger.warning(
+                "[whatsapp_cloud] call action %s rejected (status=%d): %s",
+                normalized_action,
+                resp.status_code,
+                error_msg,
+            )
+            return SendResult(success=False, error=error_msg)
+
+        return SendResult(success=True)
+
+    async def _close_calling_sidecar_session(self, call_id: str) -> bool:
+        """Best-effort close for a local WebRTC sidecar call session."""
+        if not self._calling_sidecar_enabled():
+            return False
+        if self._http_client is None:
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar configured but HTTP client "
+                "is unavailable"
+            )
+            return False
+
+        normalized_call_id = str(call_id or "").strip()
+        if not normalized_call_id:
+            return False
+
+        encoded_call_id = quote(normalized_call_id, safe="")
+        url = f"{self._calling_sidecar_url}/calls/{encoded_call_id}/close"
+        try:
+            resp = await self._http_client.post(
+                url,
+                timeout=self._calling_sidecar_timeout,
+            )
+        except Exception:
+            logger.exception(
+                "[whatsapp_cloud] calling sidecar close request failed for %s",
+                normalized_call_id,
+            )
+            return False
+
+        if resp.status_code == 404:
+            logger.debug(
+                "[whatsapp_cloud] sidecar had no session for terminated call %s",
+                normalized_call_id,
+            )
+            return True
+        if resp.status_code != 200:
+            logger.warning(
+                "[whatsapp_cloud] calling sidecar close rejected "
+                "(status=%d): %s",
+                resp.status_code,
+                str(getattr(resp, "text", ""))[:500],
+            )
+            return False
+        return True
 
     @staticmethod
     def _bounded_put(cache: "OrderedDict[str, str]", key: str, value: str) -> None:
@@ -1312,6 +1908,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 "webhook_path": self._webhook_path,
                 "verify_token_configured": bool(self._verify_token),
                 "app_secret_configured": bool(self._app_secret),
+                "calling_sidecar_configured": self._calling_sidecar_enabled(),
                 "ffmpeg_present": _FFMPEG_PATH is not None,
                 "accepted": self._accepted_count,
                 "duplicates": self._duplicate_count,
@@ -1458,16 +2055,19 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         return True
 
     async def _dispatch_payload(self, payload: Dict[str, Any]) -> None:
-        """Walk a verified Meta webhook payload and dispatch each message.
+        """Walk a verified Meta webhook payload and dispatch each message/call.
 
         Payload shape (truncated):
           {object, entry: [{id, changes: [{value: {messages, contacts,
-          statuses, metadata}, field: "messages"}]}]}
+          statuses, metadata}, field: "messages"|"calls"}]}]}
 
         We surface ``messages`` events as MessageEvents; ``statuses``
         events (sent/delivered/read/failed) are logged but not dispatched
         — the agent doesn't currently consume delivery receipts and
         forwarding them would create noisy synthetic events.
+
+        ``calls`` connect events are routed to the optional local WebRTC
+        sidecar when configured.
         """
         if payload.get("object") != "whatsapp_business_account":
             logger.debug(
@@ -1481,12 +2081,16 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             for change in entry.get("changes") or []:
                 if not isinstance(change, dict):
                     continue
-                if change.get("field") != "messages":
+                field = change.get("field")
+                value = change.get("value") or {}
+                if field == "calls":
+                    await self._dispatch_call_events(value)
+                    continue
+                if field != "messages":
                     # Other fields (account_alerts, template_status_update,
                     # etc.) are subscription-dependent and not message
                     # ingress. Silent skip.
                     continue
-                value = change.get("value") or {}
                 contacts = value.get("contacts") or []
                 metadata = value.get("metadata") or {}
                 # Build a wa_id → profile-name index for the messages we're
@@ -1548,6 +2152,92 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             status.get("status"),
                             status.get("id"),
                         )
+
+    async def _dispatch_call_events(self, value: Dict[str, Any]) -> None:
+        """Handle WhatsApp Calling webhook events from a verified payload."""
+        for raw_call in value.get("calls") or []:
+            if not isinstance(raw_call, dict):
+                continue
+            event = str(raw_call.get("event") or "").strip().lower()
+            call_id = str(raw_call.get("id") or "").strip()
+            if event == "connect":
+                await self._handle_call_connect(raw_call)
+            elif event == "terminate":
+                if call_id:
+                    await self._close_calling_sidecar_session(call_id)
+                logger.info(
+                    "[whatsapp_cloud] call terminated (call_id=%s, status=%s)",
+                    call_id,
+                    raw_call.get("status"),
+                )
+            else:
+                logger.debug(
+                    "[whatsapp_cloud] ignoring call event %r for %s",
+                    raw_call.get("event"),
+                    call_id,
+                )
+
+    async def _handle_call_connect(self, raw_call: Dict[str, Any]) -> None:
+        """Handle an inbound WhatsApp Calling connect offer."""
+        call_id = str(raw_call.get("id") or "").strip()
+        session = raw_call.get("session") or {}
+        if not isinstance(session, dict):
+            logger.warning(
+                "[whatsapp_cloud] call connect %s had non-object session",
+                call_id or "<missing>",
+            )
+            return
+
+        sdp_type = str(session.get("sdp_type") or "").strip().lower()
+        remote_sdp = str(session.get("sdp") or "")
+        if not call_id or sdp_type != "offer" or not remote_sdp.strip():
+            logger.warning(
+                "[whatsapp_cloud] ignoring malformed call connect "
+                "(call_id=%s, sdp_type=%s)",
+                call_id or "<missing>",
+                sdp_type or "<missing>",
+            )
+            return
+
+        if not self._calling_sidecar_enabled():
+            logger.info(
+                "[whatsapp_cloud] received call connect %s but no calling "
+                "sidecar is configured",
+                call_id,
+            )
+            return
+
+        answer = await self._request_calling_sidecar_answer(call_id, remote_sdp)
+        if answer is None:
+            logger.warning(
+                "[whatsapp_cloud] sidecar did not produce an SDP answer for %s",
+                call_id,
+            )
+            return
+
+        pre_accept = await self._send_call_action(
+            call_id,
+            "pre_accept",
+            sdp=answer.sdp,
+        )
+        if not pre_accept.success:
+            logger.warning(
+                "[whatsapp_cloud] pre_accept failed for %s: %s",
+                call_id,
+                pre_accept.error,
+            )
+            return
+
+        accept = await self._send_call_action(call_id, "accept", sdp=answer.sdp)
+        if not accept.success:
+            logger.warning(
+                "[whatsapp_cloud] accept failed for %s: %s",
+                call_id,
+                accept.error,
+            )
+            return
+
+        logger.info("[whatsapp_cloud] accepted call %s via calling sidecar", call_id)
 
     async def _dispatch_interactive_reply(
         self,
