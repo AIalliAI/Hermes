@@ -21,6 +21,14 @@ logger = logging.getLogger(__name__)
 OMIT_TEMPERATURE = object()
 
 
+@dataclass(frozen=True)
+class ProviderServerTools:
+    """Provider-managed tool declarations for Chat Completions requests."""
+
+    tools: list[dict[str, Any]] = field(default_factory=list)
+    replace_local_tools: bool = False
+
+
 def _profile_user_agent() -> str:
     """Return a ``hermes-cli/<version>`` UA string, with a stable fallback.
 
@@ -144,6 +152,19 @@ class ProviderProfile:
         Default: ({}, {}).
         """
         return {}, {}
+
+    def build_server_tools(
+        self, *, model: str | None = None, **context: Any
+    ) -> ProviderServerTools:
+        """Return provider-managed tools to append to the request.
+
+        OpenAI-compatible providers increasingly expose server-side tools that
+        are declared in the same ``tools`` array as local function tools, but
+        are executed by the provider rather than by Hermes. Provider profiles
+        own those declarations so the agent loop can continue dispatching only
+        local function tool calls.
+        """
+        return ProviderServerTools()
 
     def get_max_tokens(self, model: str | None) -> int | None:
         """Return the default max_tokens cap for *model*.

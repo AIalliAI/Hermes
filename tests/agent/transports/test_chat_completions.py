@@ -236,6 +236,89 @@ class TestChatCompletionsBuildKwargs:
             {"id": "pareto-router", "min_coding_score": 0.8}
         ]
 
+    def test_openrouter_fusion_force_replaces_local_tools(self, transport):
+        """Forced Fusion must be the selected tool, not just any tool."""
+        from providers import get_provider_profile
+        profile = get_provider_profile("openrouter")
+        msgs = [{"role": "user", "content": "Hi"}]
+        local_tool = {
+            "type": "function",
+            "function": {"name": "local_search", "parameters": {}},
+        }
+        kw = transport.build_kwargs(
+            model="anthropic/claude-sonnet-4.6",
+            messages=msgs,
+            tools=[local_tool],
+            provider_profile=profile,
+            openrouter_fusion={
+                "enabled": True,
+                "analysis_models": "openai/gpt-5-mini, anthropic/claude-sonnet-4.6",
+                "judge": {"model": "openai/gpt-5.4"},
+                "force": True,
+            },
+        )
+        assert kw["tools"] == [
+            {
+                "type": "openrouter:fusion",
+                "parameters": {
+                    "analysis_models": [
+                        "openai/gpt-5-mini",
+                        "anthropic/claude-sonnet-4.6",
+                    ],
+                    "model": "openai/gpt-5.4",
+                },
+            },
+        ]
+        assert kw["tool_choice"] == "required"
+        assert "plugins" not in kw.get("extra_body", {})
+
+    def test_openrouter_fusion_appends_server_tool_without_force(self, transport):
+        """Non-forced Fusion can coexist with local Hermes tools."""
+        from providers import get_provider_profile
+        profile = get_provider_profile("openrouter")
+        local_tool = {
+            "type": "function",
+            "function": {"name": "local_search", "parameters": {}},
+        }
+        kw = transport.build_kwargs(
+            model="anthropic/claude-sonnet-4.6",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[local_tool],
+            provider_profile=profile,
+            openrouter_fusion={"enabled": True},
+        )
+        assert kw["tools"] == [
+            local_tool,
+            {"type": "openrouter:fusion", "parameters": {}},
+        ]
+        assert "tool_choice" not in kw
+
+    def test_openrouter_fusion_without_force_omits_tool_choice(self, transport):
+        from providers import get_provider_profile
+        profile = get_provider_profile("openrouter")
+        kw = transport.build_kwargs(
+            model="anthropic/claude-sonnet-4.6",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_profile=profile,
+            openrouter_fusion={"enabled": True},
+        )
+        assert kw["tools"] == [{"type": "openrouter:fusion", "parameters": {}}]
+        assert "tool_choice" not in kw
+
+    def test_provider_server_tools_accepts_legacy_list_return(self, transport):
+        from providers.base import ProviderProfile
+
+        class LegacyServerToolProfile(ProviderProfile):
+            def build_server_tools(self, **_context):
+                return [{"type": "provider:server-tool", "parameters": {}}]
+
+        kw = transport.build_kwargs(
+            model="test/model",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_profile=LegacyServerToolProfile(name="legacy"),
+        )
+        assert kw["tools"] == [{"type": "provider:server-tool", "parameters": {}}]
+
     def test_nous_tags(self, transport):
         from agent.portal_tags import nous_portal_tags
         from providers import get_provider_profile

@@ -1197,10 +1197,29 @@ DEFAULT_CONFIG = {
     #   pick the strongest available coder (router's documented default
     #   when the plugins block is omitted).
     #   See: https://openrouter.ai/docs/guides/routing/routers/pareto-router
+    # fusion: enable OpenRouter Fusion server-side model collaboration.
+    #   When enabled, Hermes appends the `openrouter:fusion` server tool to
+    #   OpenRouter chat-completions requests. `force: true` sends Fusion as
+    #   the only request tool and sets `tool_choice: required`; this guarantees
+    #   Fusion is selected, but local Hermes tools are unavailable for that
+    #   request. Leave analysis_models empty to let OpenRouter choose the
+    #   analysis panel. The router model `openrouter/fusion` also works
+    #   through the normal model setting.
+    #   See: https://openrouter.ai/docs/features/fusion
     "openrouter": {
         "response_cache": True,
         "response_cache_ttl": 300,
         "min_coding_score": 0.65,
+        "fusion": {
+            "enabled": False,
+            "force": False,
+            "analysis_models": [],
+            "judge_model": "",
+            "max_tool_calls": None,
+            "max_completion_tokens": None,
+            "reasoning": {},
+            "temperature": None,
+        },
     },
 
     # AWS Bedrock provider configuration.
