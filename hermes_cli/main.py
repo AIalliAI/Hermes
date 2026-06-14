@@ -9042,11 +9042,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # build.  ``hermes desktop --build-only`` uses the content-hash stamp
         # internally, so this is effectively a no-op when nothing changed.
         # Only bother if the user has a desktop app installed (indicated by
-        # an existing packaged executable or desktop dist); people who have
-        # never run ``hermes desktop`` shouldn't be forced into a full
-        # Electron build by ``hermes update``.
+        # an existing packaged executable, desktop dist, or build stamp);
+        # people who have never run ``hermes desktop`` shouldn't be forced into
+        # a full Electron build by ``hermes update``.
+        #
+        # NOTE: We also check the build stamp because git stash operations
+        # during update (`stash --include-untracked`) may temporarily remove
+        # release/win-unpacked/ and dist/, making the file-based checks return
+        # False even though the user clearly has a desktop install. Without this
+        # fallback, every update silently destroys the desktop app shortcut.
         desktop_dir = PROJECT_ROOT / "apps" / "desktop"
-        has_desktop_app = _desktop_packaged_executable(desktop_dir) is not None or _desktop_dist_exists(desktop_dir)
+        has_desktop_app = (
+            _desktop_packaged_executable(desktop_dir) is not None
+            or _desktop_dist_exists(desktop_dir)
+            or _desktop_stamp_path().exists()
+        )
         if (desktop_dir / "package.json").exists() and shutil.which("npm") and has_desktop_app:
             print("→ Checking if desktop app needs rebuilding...")
             _desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
