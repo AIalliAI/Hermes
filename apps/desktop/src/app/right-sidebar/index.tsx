@@ -19,6 +19,7 @@ import { SidebarPanelLabel } from '../shell/sidebar-label'
 import { RemoteFolderPicker } from './files/remote-picker'
 import { ProjectTree } from './files/tree'
 import { useProjectTree } from './files/use-project-tree'
+import { HEADER_ACTION_CLASS, HEADER_ACTION_LABEL_REVEAL } from './header-actions'
 
 interface RightSidebarPaneProps {
   onActivateFile: (path: string) => void
@@ -125,13 +126,6 @@ interface FilesystemTabProps extends FileTreeBodyProps {
   onCollapseAll: () => void
   onRefresh: () => void
 }
-
-// Sidebar palette + hover-reveal: refresh tracks label hover; collapse-all
-// stays visible while any folder is expanded.
-const HEADER_ACTION_CLASS =
-  'text-sidebar-foreground/70 hover:bg-sidebar-accent! hover:text-sidebar-accent-foreground! focus-visible:ring-sidebar-ring'
-
-const HEADER_ACTION_LABEL_REVEAL = `${HEADER_ACTION_CLASS} pointer-events-none opacity-0 transition-opacity focus-visible:pointer-events-auto focus-visible:opacity-100 peer-focus-visible/project-label:pointer-events-auto peer-focus-visible/project-label:opacity-100 peer-hover/project-label:pointer-events-auto peer-hover/project-label:opacity-100`
 
 function FilesystemTab({
   canCollapse,
