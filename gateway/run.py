@@ -2008,16 +2008,13 @@ def _normalize_empty_agent_response(
         ) or ("400" in error_str and history_len > 50)
         if is_context_failure:
             return (
-                "⚠️ 会話が長くなり、モデルのコンテキスト上限に近づきました。\n"
-                "/compact で圧縮するか、/reset で新しく始めてください。"
+                "⚠️ Session too large for the model's context window.\n"
+                "Use /compact to compress the conversation, or "
+                "/reset to start fresh."
             )
-        logger.warning(
-            "Agent failed with empty response; hiding raw error from gateway user: %s",
-            str(error_detail)[:1000],
-        )
         return (
-            "⚠️ 処理中に一時的なエラーが発生しました。もう一度送ってください。\n"
-            "続く場合は /reset で新しい会話に切り替えてください。"
+            f"The request failed: {str(error_detail)[:300]}\n"
+            "Try again or use /reset to start a fresh session."
         )
 
     api_calls = int(agent_result.get("api_calls", 0) or 0)
@@ -2039,14 +2036,10 @@ def _normalize_empty_agent_response(
     if api_calls > 0:
         if agent_result.get("partial"):
             err = agent_result.get("error", "processing incomplete")
-            logger.warning(
-                "Agent stopped with partial response; hiding raw error from gateway user: %s",
-                str(err)[:1000],
-            )
-            return "⚠️ 処理が途中で止まりました。もう一度送ってください。"
+            return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."
         return (
-            "⚠️ 処理は完了しましたが、返信文を生成できませんでした。"
-            "一時的な可能性があるので、もう一度送ってください。"
+            "⚠️ Processing completed but no response was generated. "
+            "This may be a transient error — try sending your message again."
         )
 
     return response
