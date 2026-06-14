@@ -256,3 +256,43 @@ class TestUsageAccountSection:
         assert account_call["kwargs"]["base_url"] == "https://chatgpt.com/backend-api/codex"
         assert "📊 **Session Info**" in result
         assert "📈 **Account limits**" in result
+
+    @pytest.mark.asyncio
+    async def test_usage_command_uses_configured_provider_before_first_agent_turn(self, monkeypatch):
+        runner = _make_runner(SK)
+        runner.config = {"model": {"provider": "openai-codex", "base_url": "https://chatgpt.com/backend-api/codex"}}
+        runner.session_store.get_or_create_session.return_value = MagicMock(session_id="sess-blank")
+        runner.session_store.load_transcript.return_value = []
+
+        calls = []
+
+        async def _fake_to_thread(fn, *args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            return fn(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "gateway.slash_commands.load_config",
+            lambda: {"model": {"provider": "openai-codex", "base_url": "https://chatgpt.com/backend-api/codex"}},
+        )
+        monkeypatch.setattr("gateway.run.asyncio.to_thread", _fake_to_thread)
+        monkeypatch.setattr(
+            "gateway.slash_commands.fetch_account_usage",
+            lambda provider, base_url=None, api_key=None: object(),
+        )
+        monkeypatch.setattr(
+            "gateway.slash_commands.render_account_usage_lines",
+            lambda snapshot, markdown=False: [
+                "📈 **Account limits**",
+                "Provider: openai-codex (Plus)",
+                "Session: 44% remaining (56% used)",
+            ],
+        )
+        monkeypatch.setattr("agent.account_usage.nous_credits_lines", lambda markdown=False: [])
+
+        event = MagicMock()
+        result = await runner._handle_usage_command(event)
+
+        account_call = next(c for c in calls if c["args"] == ("openai-codex",))
+        assert account_call["kwargs"]["base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert "📈 **Account limits**" in result
+        assert "Provider: openai-codex (Plus)" in result

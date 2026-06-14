@@ -34,7 +34,7 @@ from agent.i18n import t
 from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
-from hermes_cli.config import cfg_get
+from hermes_cli.config import cfg_get, load_config
 from utils import (
     atomic_json_write,
     atomic_yaml_write,
@@ -3013,6 +3013,22 @@ class GatewaySlashCommandsMixin:
                 persisted = {}
             provider = provider or persisted.get("billing_provider")
             base_url = base_url or persisted.get("billing_base_url")
+
+        # Account limits are account/provider-level data, not session-level data.
+        # A fresh gateway thread (or a slash command before the first agent turn)
+        # may have no resident agent and no persisted billing_provider yet; still
+        # fall back to the configured provider so `/usage` can answer quota checks
+        # like OpenAI Codex's 5-hour/weekly windows without requiring a prior chat
+        # message in that exact session/topic.
+        if not provider:
+            try:
+                # `self.config` is the gateway/platform config, not the Hermes
+                # model config, so read config.yaml directly for model.provider.
+                _cfg = load_config()
+                provider = cfg_get(_cfg, "model", "provider")
+                base_url = base_url or cfg_get(_cfg, "model", "base_url")
+            except Exception:
+                provider = None
 
         # Fetch account usage off the event loop so slow provider APIs don't
         # block the gateway. Failures are non-fatal -- account_lines stays [].

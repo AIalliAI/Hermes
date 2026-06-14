@@ -8410,7 +8410,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         which would otherwise early-return before any credits showed.
         """
         if not self.agent:
-            if not self._print_nous_credits_block():
+            printed_account = self._print_configured_account_usage_block()
+            printed_nous = self._print_nous_credits_block()
+            if not (printed_account or printed_nous):
                 print("(._.) No active agent -- send a message first.")
             return
 
@@ -8418,7 +8420,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         calls = agent.session_api_calls
 
         if calls == 0:
-            if not self._print_nous_credits_block():
+            printed_account = self._print_configured_account_usage_block(agent=agent)
+            printed_nous = self._print_nous_credits_block()
+            if not (printed_account or printed_nous):
                 print("(._.) No API calls made yet in this session.")
             return
 
@@ -8530,6 +8534,44 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # into stream-retry events, credential rotations, etc.
             # Console quietness is enforced by hermes_logging not
             # installing a console StreamHandler in non-verbose mode.
+
+    def _print_configured_account_usage_block(self, *, agent=None) -> bool:
+        """Print provider account limits using a live agent or config fallback.
+
+        This keeps `/usage` useful before the first API call / active agent,
+        especially for OpenAI Codex quota windows which are account-level data.
+        """
+        provider = getattr(agent, "provider", None) if agent is not None else None
+        base_url = getattr(agent, "base_url", None) if agent is not None else None
+        api_key = getattr(agent, "api_key", None) if agent is not None else None
+        if not provider:
+            provider = getattr(self, "provider", None)
+            base_url = base_url or getattr(self, "base_url", None)
+            api_key = api_key or getattr(self, "api_key", None)
+        if not provider:
+            try:
+                from hermes_cli.config import cfg_get, load_config
+
+                _cfg = load_config()
+                provider = cfg_get(_cfg, "model", "provider")
+                base_url = base_url or cfg_get(_cfg, "model", "base_url")
+            except Exception:
+                provider = None
+        if not provider:
+            return False
+        try:
+            from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+            snapshot = fetch_account_usage(provider, base_url=base_url, api_key=api_key)
+            lines = render_account_usage_lines(snapshot)
+        except Exception:
+            lines = []
+        if not lines:
+            return False
+        print()
+        for line in lines:
+            print(f"  {line}")
+        return True
 
     def _print_nous_credits_block(self) -> bool:
         """Print the Nous credits magnitudes + monthly-grant gauge when a Nous account
