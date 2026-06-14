@@ -1,8 +1,10 @@
 import { atom, computed } from 'nanostores'
 
+import { translateNow } from '@/i18n'
 import type { TodoItem, TodoStatus } from '@/lib/todos'
 
 import { $gateway } from './gateway'
+import { dispatchNativeNotification } from './native-notifications'
 import { $subagentsBySession, type SubagentProgress } from './subagents'
 import { $todosBySession } from './todos'
 
@@ -160,6 +162,25 @@ export function reconcileBackgroundProcesses(sid: string, procs: GatewayProcessE
   )
 
   const prev = $backgroundStatusBySession.get()[sid] ?? []
+
+  // A process that was running on the previous snapshot and now reports as
+  // exited just finished — fire a native notification (gated on focus/prefs).
+  const prevState = new Map(prev.map(item => [item.id, item.state]))
+
+  for (const [id, item] of fresh) {
+    if (item.state !== 'running' && prevState.get(id) === 'running') {
+      dispatchNativeNotification({
+        body: item.title,
+        kind: 'backgroundDone',
+        sessionId: sid,
+        title: translateNow(
+          item.state === 'failed'
+            ? 'notifications.native.backgroundFailedTitle'
+            : 'notifications.native.backgroundDoneTitle'
+        )
+      })
+    }
+  }
 
   const kept = prev.flatMap(old => {
     const next = fresh.get(old.id)
