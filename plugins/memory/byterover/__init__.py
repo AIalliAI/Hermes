@@ -64,7 +64,7 @@ def _get_model_config():
     from hermes_constants import get_hermes_home
     config_path = get_hermes_home() / "config.yaml"
     try:
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8") as f:
             config = yaml.safe_load(f)
         model_cfg = config.get("model", {})
         _model_config_cache = {
