@@ -836,13 +836,24 @@ def _ensure_web_plugins_loaded() -> None:
     # Belt-and-suspenders: guarantee the keyless Parallel default (the
     # documented zero-setup backend for both web_search and web_extract) is
     # actually registered. The lookup is a cheap dict hit on the healthy path
-    # (discovery already registered it → no-op); only an empty registry pays
-    # for the direct-registration sweep.
+    # (discovery already registered it → no-op). When the user explicitly
+    # disabled web-parallel its absence is intentional, not a failed sweep —
+    # without that check every call would re-pay the direct-registration
+    # sweep and overwrite live registry entries with fresh bundled instances.
+    # An *empty* registry still always triggers the sweep: a failed sweep
+    # registers nothing at all, so emptiness is the failure signal that keeps
+    # the other bundled backends recoverable even with web-parallel disabled.
     try:
-        from agent.web_search_registry import get_provider
+        from agent.web_search_registry import get_provider, list_providers
+        from hermes_cli.plugins import _get_disabled_plugins
 
         if get_provider("parallel") is None:
-            _register_bundled_web_providers_directly()
+            disabled = _get_disabled_plugins()
+            parallel_off = (
+                "web/parallel" in disabled or "web-parallel" in disabled
+            )
+            if not parallel_off or not list_providers():
+                _register_bundled_web_providers_directly()
     except Exception as exc:  # noqa: BLE001
         logger.debug("Bundled web provider fallback check failed: %s", exc)
 
