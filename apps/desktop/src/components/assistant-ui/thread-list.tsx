@@ -24,7 +24,7 @@ import {
 
 import { MessageRenderBoundary } from './message-render-boundary'
 
-type ThreadMessageComponents = ComponentProps<typeof ThreadPrimitive.MessageByIndex>['components']
+export type ThreadMessageComponents = ComponentProps<typeof ThreadPrimitive.MessageByIndex>['components']
 
 type MessageGroup = { id: string; weight: number } & (
   | { index: number; kind: 'standalone' }

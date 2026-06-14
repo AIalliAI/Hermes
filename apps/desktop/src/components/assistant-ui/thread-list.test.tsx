@@ -2,7 +2,11 @@ import { render } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { ThreadMessageList } from './thread-list'
+import { ThreadMessageList, type ThreadMessageComponents } from './thread-list'
+
+// The test mocks @assistant-ui/react and never renders real message components,
+// so an empty, correctly-typed components map is all these cases need.
+const noComponents = {} as ThreadMessageComponents
 
 type MockMessage = {
   content: unknown[]
@@ -90,7 +94,7 @@ describe('ThreadMessageList session settle', () => {
     const sharedContentRef = stickState.contentRef
 
     const { rerender } = render(
-      <ThreadMessageList clampToComposer={false} components={{}} loadingIndicator={null} sessionKey="session-a" />
+      <ThreadMessageList clampToComposer={false} components={noComponents} loadingIndicator={null} sessionKey="session-a" />
     )
 
     expect(initialStop).toHaveBeenCalledTimes(1)
@@ -103,7 +107,7 @@ describe('ThreadMessageList session settle', () => {
       stopScroll: vi.fn()
     }
 
-    rerender(<ThreadMessageList clampToComposer={false} components={{}} loadingIndicator={<div />} sessionKey="session-a" />)
+    rerender(<ThreadMessageList clampToComposer={false} components={noComponents} loadingIndicator={<div />} sessionKey="session-a" />)
 
     expect(stickState.stopScroll).not.toHaveBeenCalled()
   })
@@ -113,7 +117,7 @@ describe('ThreadMessageList session settle', () => {
     const sharedContentRef = stickState.contentRef
 
     const { rerender } = render(
-      <ThreadMessageList clampToComposer={false} components={{}} loadingIndicator={null} sessionKey="session-a" />
+      <ThreadMessageList clampToComposer={false} components={noComponents} loadingIndicator={null} sessionKey="session-a" />
     )
 
     stickState = {
@@ -124,7 +128,7 @@ describe('ThreadMessageList session settle', () => {
       stopScroll: vi.fn()
     }
 
-    rerender(<ThreadMessageList clampToComposer={false} components={{}} loadingIndicator={null} sessionKey="session-b" />)
+    rerender(<ThreadMessageList clampToComposer={false} components={noComponents} loadingIndicator={null} sessionKey="session-b" />)
 
     expect(stickState.stopScroll).toHaveBeenCalledTimes(1)
   })
