@@ -68,7 +68,10 @@ export type GatewayEventPayload = {
   start?: number
   count?: number
   // status.update (kind=process → background process completion/watch-match)
+  // from the gateway's notification poller (tui_gateway/server.py)
   kind?: string
+  event_type?: string
+  exit_code?: null | number
 }
 
 export function textPart(text: string): ChatMessagePart {

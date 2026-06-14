@@ -29,6 +29,7 @@ import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { $gateway } from '@/store/gateway'
 import { notify } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
+import { $processNotificationsMode, processCompletionToast } from '@/store/process-notifications'
 import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
 import {
   setCurrentBranch,
@@ -1022,10 +1023,23 @@ export function useMessageStream({
           })
         }
       } else if (event.type === 'status.update') {
-        // The gateway's notification poller announces background process
-        // completions / watch matches here — re-sync the status stack.
+        // The gateway's notification poller (tui_gateway/server.py) announces
+        // background process completions / watch matches here — re-sync the
+        // status stack.
         if (sessionId && payload?.kind === 'process') {
           void refreshBackgroundProcesses(sessionId)
+        }
+        // The poller also chains an agent turn that surfaces the text in-chat;
+        // the native toast covers the hands-off case (#44201) — window hidden,
+        // or the process belongs to a chat the user isn't looking at. Gated by
+        // the same config the messaging gateways honor:
+        // display.background_process_notifications.
+        if (payload?.kind === 'process') {
+          const toast = processCompletionToast(payload, $processNotificationsMode.get())
+
+          if (toast && (document.hidden || sessionId !== activeSessionIdRef.current)) {
+            void window.hermesDesktop?.notify(toast)
+          }
         }
       } else if (event.type === 'error') {
         const errorMessage = payload?.message || 'Hermes reported an error'
