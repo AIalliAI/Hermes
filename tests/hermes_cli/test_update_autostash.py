@@ -304,6 +304,97 @@ def test_restore_stashed_changes_auto_resets_non_interactive(monkeypatch, tmp_pa
     assert len(reset_calls) == 1
 
 
+def test_restore_stashed_changes_resets_when_clean_apply_reintroduces_syntax_error(
+    monkeypatch, tmp_path, capsys
+):
+    """A *clean* stash apply (no merge conflict) can still re-brick the tree.
+
+    If the stash captured orphan conflict markers from an earlier interrupted
+    update, they re-apply as ordinary content — ``git stash apply`` reports
+    success with no unmerged entries — and the file imports with a
+    SyntaxError. The post-pull guard ran *before* this restore, so it can't
+    catch poison the restore itself reintroduces. This path has to re-validate,
+    reset to HEAD, and keep the stash for recovery.
+
+    Regression for the desktop crash-loop where ``tui_gateway/server.py`` was
+    left starting with ``<<<<<<< Updated upstream`` while ``hermes update``
+    kept reporting success (issue #46791).
+    """
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if cmd[1:3] == ["stash", "apply"]:
+            return SimpleNamespace(stdout="applied\n", stderr="", returncode=0)
+        if cmd[1:3] == ["diff", "--name-only"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd[1:3] == ["reset", "--hard"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        raise AssertionError(f"unexpected command after poisoned restore: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        hermes_main,
+        "_validate_critical_files_syntax",
+        lambda root: (
+            False,
+            str(Path(root) / "tui_gateway/server.py"),
+            "SyntaxError: invalid syntax",
+        ),
+    )
+
+    result = hermes_main._restore_stashed_changes(
+        ["git"], tmp_path, "abc123", prompt_user=False
+    )
+
+    assert result is False
+    out = capsys.readouterr().out
+    assert "re-introduced a syntax error" in out
+    assert "tui_gateway/server.py" in out
+    assert "stashed changes are preserved" in out
+    assert "Working tree reset to clean state" in out
+    assert "git stash apply abc123" in out
+    # Reset exactly once, and the stash is NOT dropped — it stays recoverable.
+    assert [c[1:3] for c, _ in calls] == [
+        ["stash", "apply"],
+        ["diff", "--name-only"],
+        ["reset", "--hard"],
+    ]
+    assert not any(c[1:3] == ["stash", "drop"] for c, _ in calls)
+
+
+def test_restore_stashed_changes_drops_stash_when_clean_apply_validates(
+    monkeypatch, tmp_path
+):
+    """The post-restore syntax check must not disturb the happy path: a clean
+    apply whose critical files still parse proceeds to drop the stash."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if cmd[1:3] == ["stash", "apply"]:
+            return SimpleNamespace(stdout="applied\n", stderr="", returncode=0)
+        if cmd[1:3] == ["diff", "--name-only"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd[1:3] == ["stash", "list"]:
+            return SimpleNamespace(stdout="stash@{0} abc123\n", stderr="", returncode=0)
+        if cmd[1:3] == ["stash", "drop"]:
+            return SimpleNamespace(stdout="dropped\n", stderr="", returncode=0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        hermes_main, "_validate_critical_files_syntax", lambda root: (True, None, None)
+    )
+
+    result = hermes_main._restore_stashed_changes(
+        ["git"], tmp_path, "abc123", prompt_user=False
+    )
+
+    assert result is True
+    assert any(c[1:3] == ["stash", "drop"] for c, _ in calls)
+
+
 def test_stash_local_changes_if_needed_raises_when_stash_ref_missing(monkeypatch, tmp_path):
     def fake_run(cmd, **kwargs):
         if cmd[-2:] == ["status", "--porcelain"]:

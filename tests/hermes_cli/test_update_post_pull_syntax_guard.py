@@ -116,6 +116,33 @@ def test_validate_critical_files_syntax_detects_break_in_main_py(tmp_path):
     assert failing_path is not None and failing_path.endswith("hermes_cli/main.py")
 
 
+def test_validate_critical_files_syntax_detects_break_in_gateway_server(tmp_path):
+    """The desktop/gateway hot path is guarded too. ``tui_gateway/server.py``
+    is not imported by the CLI at startup, so a break there still lets
+    ``hermes update`` run — but it crash-loops the desktop backend on the first
+    gateway WebSocket. The guard must catch it like the CLI-bootstrap files
+    (issue #46791)."""
+    _populate_critical_tree(tmp_path, broken_file="tui_gateway/server.py")
+
+    ok, failing_path, error = hermes_main._validate_critical_files_syntax(tmp_path)
+
+    assert ok is False
+    assert failing_path is not None and failing_path.endswith("tui_gateway/server.py")
+    assert error is not None
+
+
+def test_gateway_import_chain_is_in_critical_files():
+    """gateway_ws → tui_gateway.ws → tui_gateway.server is the desktop import
+    chain that bricked installs when it carried conflict markers; all three
+    must be validated on update so the guard's auto-rollback covers them."""
+    for relpath in (
+        "hermes_cli/web_server.py",
+        "tui_gateway/ws.py",
+        "tui_gateway/server.py",
+    ):
+        assert relpath in hermes_main._UPDATE_CRITICAL_FILES
+
+
 def test_validate_critical_files_syntax_tolerates_missing_files(tmp_path):
     """A refactor may legitimately remove one of the critical files — the
     guard should skip missing files, not falsely flag the install as broken."""

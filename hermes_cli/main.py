@@ -4366,6 +4366,16 @@ _UPDATE_CRITICAL_FILES = (
     "model_tools.py",
     "toolsets.py",
     "hermes_constants.py",
+    # Desktop/gateway hot path. These are not imported by the CLI at startup
+    # (so a break here still lets ``hermes update`` run), but they ARE imported
+    # lazily on the first gateway WebSocket — gateway_ws → tui_gateway.ws →
+    # tui_gateway.server. A syntax error here (e.g. orphan ``<<<<<<<`` conflict
+    # markers re-applied from an autostash) leaves the CLI bootable but crash-
+    # loops the desktop backend on every connection, which presents to the user
+    # as a permanently broken desktop app. Validate them on update too.
+    "hermes_cli/web_server.py",
+    "tui_gateway/ws.py",
+    "tui_gateway/server.py",
 )
 
 
@@ -6253,6 +6263,37 @@ def _restore_stashed_changes(
         # Don't sys.exit — the code update itself succeeded, only the stash
         # restore had conflicts.  Let cmd_update continue with pip install,
         # skill sync, and gateway restart.
+        return False
+
+    # The apply was clean (returncode 0, no unmerged entries) — but a clean
+    # apply can still re-brick the tree. If the stash captured orphan conflict
+    # markers from an earlier interrupted update, or a local edit that doesn't
+    # parse, those lines re-apply silently as ordinary content and produce a
+    # tree that imports with a SyntaxError. The post-pull guard ran *before*
+    # this restore, so it can't catch poison the restore itself reintroduces —
+    # this is the failure mode where a desktop install crash-loops on the
+    # gateway WebSocket while ``hermes update`` keeps reporting success. Re-
+    # validate the critical files now; if the restore broke one, roll the
+    # working tree back to HEAD and keep the stash so nothing is lost.
+    syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(cwd)
+    if not syntax_ok:
+        print(
+            "✗ Restoring local changes re-introduced a syntax error in a critical file:"
+        )
+        print(f"  {failing_path}")
+        if syntax_error:
+            for line in str(syntax_error).splitlines()[:6]:
+                print(f"    {line}")
+        print("\nYour stashed changes are preserved — nothing is lost.")
+        print(f"  Stash ref: {stash_ref}")
+        subprocess.run(
+            git_cmd + ["reset", "--hard", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+        )
+        print("Working tree reset to clean state so Hermes stays runnable.")
+        print(f"Restore your changes later with: git stash apply {stash_ref}")
+        # Leave the stash in place (don't drop it) so the user can recover.
         return False
 
     stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
