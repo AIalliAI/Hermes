@@ -5110,6 +5110,16 @@ def _purge_electron_build_cache(desktop_dir: Path) -> list[Path]:
     return removed
 
 
+# Public Electron mirror used as a last-resort fallback when GitHub's release
+# host is blocked/throttled (the repeating "retrying" download symptom).
+# npmmirror.com is the de-facto Electron community mirror (Alibaba). @electron/get
+# SHASUM-checks the download, but the SHASUMS come from the same mirror — that
+# guards against a corrupt/partial download, NOT a compromised mirror. Reaching
+# for it is an explicit trust trade-off we only make AFTER the canonical GitHub
+# download has failed, and we never override a user-pinned ELECTRON_MIRROR.
+_ELECTRON_FALLBACK_MIRROR = "https://npmmirror.com/mirrors/electron/"
+
+
 def _electron_dist_binary(project_root: Path) -> Path:
     """Return the path to the Electron main binary inside ``node_modules``.
 
@@ -5416,9 +5426,34 @@ def cmd_gui(args: argparse.Namespace):
             nixos_env = _nixos_build_env()
             install_result = _run_npm_install_deterministic(npm, PROJECT_ROOT, capture_output=False, env=nixos_env)
             if install_result.returncode != 0:
-                print("✗ Desktop dependency install failed")
-                print(f"  Run manually:  cd {PROJECT_ROOT} && npm ci")
-                sys.exit(install_result.returncode or 1)
+                # The most common dependency-install failure is electron's
+                # postinstall binary download being blocked/throttled: its
+                # install.js does `process.exit(1)` on a failed download, which
+                # fails the whole `npm ci`/`npm install` (#47266, #47917). npm
+                # runs postinstall scripts LAST — after every package is already
+                # staged on disk — so when the binary download is the casualty
+                # the only thing missing is node_modules/electron/dist. Repopulate
+                # it via electron's own downloader (canonical source first, then a
+                # public mirror when the user hasn't pinned one) and carry on to
+                # the build instead of aborting here. Without this, the mirror
+                # self-heal further down is dead code on a blocked network: it
+                # only runs after a failed `pack`, but the install step exits
+                # first so `pack` is never reached.
+                repaired = False
+                if not _electron_dist_ok(PROJECT_ROOT):
+                    repaired = _redownload_electron_dist(PROJECT_ROOT, env)
+                    if not repaired and not env.get("ELECTRON_MIRROR"):
+                        repaired = _redownload_electron_dist(
+                            PROJECT_ROOT, env, mirror=_ELECTRON_FALLBACK_MIRROR
+                        )
+                if repaired:
+                    print("  ⚠ Dependency install failed on the Electron binary "
+                          "download; repopulated node_modules/electron/dist via a "
+                          "mirror and continuing.")
+                else:
+                    print("✗ Desktop dependency install failed")
+                    print(f"  Run manually:  cd {PROJECT_ROOT} && npm ci")
+                    sys.exit(install_result.returncode or 1)
 
             build_label = "source build" if source_mode else "packaged app"
             print(f"→ Building desktop {build_label}...")
@@ -5479,7 +5514,7 @@ def cmd_gui(args: argparse.Namespace):
                 print("  ⚠ Desktop build still failing; the Electron download from "
                       "GitHub looks blocked. Re-downloading via a public mirror "
                       "(npmmirror.com)... (set ELECTRON_MIRROR to use another mirror)")
-                mirror = "https://npmmirror.com/mirrors/electron/"
+                mirror = _ELECTRON_FALLBACK_MIRROR
                 mirror_env = dict(env)
                 mirror_env["ELECTRON_MIRROR"] = mirror
                 # electronDist is pinned (#38673), so `npm run pack` never

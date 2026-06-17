@@ -592,6 +592,125 @@ def test_gui_does_not_override_user_electron_mirror(tmp_path, monkeypatch, capsy
     assert "Desktop GUI build failed" in capsys.readouterr().out
 
 
+def test_gui_install_failure_redownloads_electron_then_builds(tmp_path, monkeypatch, capsys):
+    """A failed dependency install whose only casualty is the Electron binary
+    download (#47266/#47917) repopulates node_modules/electron/dist via the
+    downloader and CONTINUES to the build instead of aborting — otherwise the
+    mirror self-heal after `pack` is unreachable on a blocked network because
+    electron's install.js fails the whole `npm ci` first."""
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    packaged_exe = _make_packaged_executable(root, monkeypatch)
+    monkeypatch.delenv("ELECTRON_MIRROR", raising=False)
+
+    install_fail = subprocess.CompletedProcess(["npm", "ci"], 1)
+    pack_ok = subprocess.CompletedProcess(["npm", "run", "pack"], 0)
+    launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
+
+    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_fail), \
+         patch("hermes_cli.main._desktop_build_needed", return_value=True), \
+         patch("hermes_cli.main._write_desktop_build_stamp"), \
+         patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main._electron_dist_ok", return_value=False), \
+         patch("hermes_cli.main._redownload_electron_dist", return_value=True) as mock_dl, \
+         patch("hermes_cli.main.subprocess.run", side_effect=[pack_ok, launch_ok]) as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns())
+
+    assert exc.value.code == 0
+    # Canonical (no-mirror) re-download repopulated the dist; no mirror needed.
+    mock_dl.assert_called_once()
+    assert mock_dl.call_args.kwargs.get("mirror") is None
+    # The build proceeded despite the failed dependency install.
+    assert mock_run.call_args_list[0].args[0] == ["/usr/bin/npm", "run", "pack"]
+    out = capsys.readouterr().out
+    assert "repopulated node_modules/electron/dist" in out
+    assert "Desktop dependency install failed" not in out
+
+
+def test_gui_install_failure_falls_back_to_mirror_redownload(tmp_path, monkeypatch, capsys):
+    """When the canonical re-download also fails and the user has not pinned a
+    mirror, the install-failure path drives electron's downloader via the public
+    mirror before giving up — then continues to the build."""
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    packaged_exe = _make_packaged_executable(root, monkeypatch)
+    monkeypatch.delenv("ELECTRON_MIRROR", raising=False)
+
+    install_fail = subprocess.CompletedProcess(["npm", "ci"], 1)
+    pack_ok = subprocess.CompletedProcess(["npm", "run", "pack"], 0)
+    launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
+
+    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_fail), \
+         patch("hermes_cli.main._desktop_build_needed", return_value=True), \
+         patch("hermes_cli.main._write_desktop_build_stamp"), \
+         patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main._electron_dist_ok", return_value=False), \
+         patch("hermes_cli.main._redownload_electron_dist", side_effect=[False, True]) as mock_dl, \
+         patch("hermes_cli.main.subprocess.run", side_effect=[pack_ok, launch_ok]) as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns())
+
+    assert exc.value.code == 0
+    assert mock_dl.call_count == 2
+    assert mock_dl.call_args_list[0].kwargs.get("mirror") is None
+    assert mock_dl.call_args_list[1].kwargs["mirror"] == cli_main._ELECTRON_FALLBACK_MIRROR
+    assert mock_run.call_args_list[0].args[0] == ["/usr/bin/npm", "run", "pack"]
+
+
+def test_gui_install_failure_aborts_when_electron_unrecoverable(tmp_path, monkeypatch, capsys):
+    """If the Electron binary can't be fetched at all (canonical AND mirror
+    blocked), the install failure aborts exactly as before — no build attempt."""
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    _make_packaged_executable(root, monkeypatch)
+    monkeypatch.delenv("ELECTRON_MIRROR", raising=False)
+
+    install_fail = subprocess.CompletedProcess(["npm", "ci"], 1)
+
+    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_fail), \
+         patch("hermes_cli.main._desktop_build_needed", return_value=True), \
+         patch("hermes_cli.main._electron_dist_ok", return_value=False), \
+         patch("hermes_cli.main._redownload_electron_dist", return_value=False) as mock_dl, \
+         patch("hermes_cli.main.subprocess.run") as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns())
+
+    assert exc.value.code == 1
+    assert mock_dl.call_count == 2  # canonical, then mirror — both failed
+    mock_run.assert_not_called()  # never reached the build
+    assert "Desktop dependency install failed" in capsys.readouterr().out
+
+
+def test_gui_install_failure_does_not_add_mirror_when_user_pinned(tmp_path, monkeypatch, capsys):
+    """A user-pinned ELECTRON_MIRROR is honored by the downloader itself, so the
+    install-failure path makes exactly ONE re-download attempt (no npmmirror
+    fallback) and never overrides the user's mirror."""
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    _make_packaged_executable(root, monkeypatch)
+    monkeypatch.setenv("ELECTRON_MIRROR", "https://mirror.example/electron/")
+
+    install_fail = subprocess.CompletedProcess(["npm", "ci"], 1)
+
+    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_fail), \
+         patch("hermes_cli.main._desktop_build_needed", return_value=True), \
+         patch("hermes_cli.main._electron_dist_ok", return_value=False), \
+         patch("hermes_cli.main._redownload_electron_dist", return_value=False) as mock_dl, \
+         patch("hermes_cli.main.subprocess.run") as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns())
+
+    assert exc.value.code == 1
+    mock_dl.assert_called_once()
+    assert mock_dl.call_args.kwargs.get("mirror") is None
+    mock_run.assert_not_called()
+
+
 # ── electronDist (re)download helper tests (#47266) ───────────────────
 
 

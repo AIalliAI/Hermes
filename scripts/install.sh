@@ -2500,20 +2500,44 @@ install_desktop() {
     #    `tsc -b` failing with no obvious cause. Fall back to `npm install`
     #    only if `npm ci` is unavailable or the lockfile is out of sync.
     log_info "Installing desktop workspace dependencies (includes Electron ~150MB, 1-3min)..."
-    ( cd "$INSTALL_DIR" && npm ci ) || ( cd "$INSTALL_DIR" && npm install ) || {
-        log_error "Desktop workspace npm install failed"
-        # Common cause: a previous 'sudo npm'/'sudo npx' left root-owned files in
-        # ~/.npm, so this non-root install can't write the shared cache. npm hides
-        # it behind a confusing EEXIST / "File exists" message while the real errno
-        # is EACCES (-13). Point the user at the fix instead of a raw npm trace.
-        log_info "If the errors above mention EACCES / 'permission denied' / EEXIST while"
-        log_info "writing the npm cache, your ~/.npm likely holds root-owned files from an"
-        log_info "earlier 'sudo npm' or 'sudo npx'. Reclaim ownership and retry:"
-        log_info "  sudo chown -R \"\$(id -un)\" ~/.npm && npm cache verify"
-        log_info "Then re-run this installer, or build manually:"
-        log_info "  cd \"$INSTALL_DIR\" && npm ci && cd apps/desktop && npm run pack"
-        return 1
-    }
+    local deps_ok=true
+    ( cd "$INSTALL_DIR" && npm ci ) || ( cd "$INSTALL_DIR" && npm install ) || deps_ok=false
+    if [ "$deps_ok" = false ]; then
+        # The usual cause is electron's postinstall binary download being
+        # blocked/throttled: its install.js does `process.exit(1)` on a failed
+        # download, which fails the whole `npm ci`/`npm install` (#47266, #47917).
+        # npm runs postinstall scripts LAST — after every package is already
+        # staged on disk — so when the binary download is the casualty the only
+        # thing missing is node_modules/electron/dist. Repopulate it via
+        # electron's own downloader (canonical source first, then the public
+        # mirror when the user hasn't pinned one) and carry on to the build; the
+        # mirror self-heal in step 2 below only runs after a failed `pack`, so on
+        # a blocked network the install bails before it can ever be reached.
+        local deps_repaired=false
+        if ! _electron_dist_ok "$INSTALL_DIR"; then
+            if _restore_electron_dist "$INSTALL_DIR"; then
+                deps_repaired=true
+            elif [ -z "${ELECTRON_MIRROR:-}" ] && _restore_electron_dist "$INSTALL_DIR" "$DESKTOP_ELECTRON_FALLBACK_MIRROR"; then
+                deps_repaired=true
+            fi
+        fi
+        if [ "$deps_repaired" = true ]; then
+            log_warn "Dependency install failed on the Electron binary download; repopulated node_modules/electron/dist via a mirror and continuing."
+        else
+            log_error "Desktop workspace npm install failed"
+            # Common cause: a previous 'sudo npm'/'sudo npx' left root-owned files in
+            # ~/.npm, so this non-root install can't write the shared cache. npm hides
+            # it behind a confusing EEXIST / "File exists" message while the real errno
+            # is EACCES (-13). Point the user at the fix instead of a raw npm trace.
+            log_info "If the errors above mention EACCES / 'permission denied' / EEXIST while"
+            log_info "writing the npm cache, your ~/.npm likely holds root-owned files from an"
+            log_info "earlier 'sudo npm' or 'sudo npx'. Reclaim ownership and retry:"
+            log_info "  sudo chown -R \"\$(id -un)\" ~/.npm && npm cache verify"
+            log_info "Then re-run this installer, or build manually:"
+            log_info "  cd \"$INSTALL_DIR\" && npm ci && cd apps/desktop && npm run pack"
+            return 1
+        fi
+    fi
     log_success "Desktop workspace dependencies installed"
 
     # 2. Build, with up to three escalating attempts so a transient/blocked
