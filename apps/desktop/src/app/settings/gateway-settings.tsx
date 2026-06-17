@@ -1,9 +1,8 @@
 import { useStore } from '@nanostores/react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import type { DesktopAuthProvider, DesktopConnectionProbeResult } from '@/global'
 import { useI18n } from '@/i18n'
 import { AlertCircle, Check, FileText, Globe, Loader2, LogIn, Monitor } from '@/lib/icons'
 import { cn } from '@/lib/utils'
@@ -12,10 +11,10 @@ import { $profiles, refreshActiveProfile } from '@/store/profile'
 
 import { CONTROL_TEXT } from './constants'
 import { EmptyState, ListRow, LoadingState, Pill, SettingsContent } from './primitives'
+import { useRemoteAuthProbe } from './use-remote-connect'
 
 type Mode = 'local' | 'remote'
 type AuthMode = 'oauth' | 'token'
-type ProbeStatus = 'idle' | 'probing' | 'done' | 'error'
 
 interface GatewaySettingsState {
   envOverride: boolean
@@ -115,13 +114,6 @@ export function GatewaySettings() {
     void refreshActiveProfile()
   }, [])
 
-  // Auth-mode probe: as the user types a remote URL we ask the gateway (via
-  // its public /api/status) whether it gates with OAuth or a static session
-  // token, so we can show the right control (login button vs token box).
-  const [probeStatus, setProbeStatus] = useState<ProbeStatus>('idle')
-  const [probe, setProbe] = useState<DesktopConnectionProbeResult | null>(null)
-  const probeSeq = useRef(0)
-
   useEffect(() => {
     let cancelled = false
     const desktop = window.hermesDesktop
@@ -157,109 +149,18 @@ export function GatewaySettings() {
     return () => void (cancelled = true)
   }, [scope])
 
-  // Debounced probe of the entered remote URL. Only runs in remote mode with a
-  // syntactically plausible URL. The probe result drives whether we render the
-  // OAuth login button or the session-token entry box. The effective auth mode
-  // prefers a fresh probe result over the saved value.
+  // Auth-mode probe (URL → OAuth/password vs session-token), extracted so the
+  // first-run connect overlay shares the exact same resolution rules.
   const trimmedUrl = state.remoteUrl.trim()
-  useEffect(() => {
-    if (state.mode !== 'remote' || !trimmedUrl || !/^https?:\/\//i.test(trimmedUrl)) {
-      setProbeStatus('idle')
-      setProbe(null)
-
-      return
-    }
-
-    const desktop = window.hermesDesktop
-
-    if (!desktop?.probeConnectionConfig) {
-      return
-    }
-
-    const seq = ++probeSeq.current
-    setProbeStatus('probing')
-
-    const timer = setTimeout(() => {
-      desktop
-        .probeConnectionConfig(trimmedUrl)
-        .then(result => {
-          if (seq !== probeSeq.current) {
-            return
-          }
-
-          setProbe(result)
-          setProbeStatus(result.reachable ? 'done' : 'error')
-        })
-        .catch(() => {
-          if (seq !== probeSeq.current) {
-            return
-          }
-
-          setProbe(null)
-          setProbeStatus('error')
-        })
-    }, 500)
-
-    return () => clearTimeout(timer)
-  }, [state.mode, trimmedUrl])
-
-  // Effective auth mode: a reachable probe wins; otherwise fall back to the
-  // saved config's mode so a re-open of settings doesn't flicker.
-  const authMode: AuthMode = useMemo(() => {
-    if (probeStatus === 'done' && probe && probe.authMode !== 'unknown') {
-      return probe.authMode
-    }
-
-    return state.remoteAuthMode
-  }, [probe, probeStatus, state.remoteAuthMode])
-
-  // Whether we actually KNOW how this gateway authenticates yet. Until we do,
-  // neither the OAuth button nor the session-token box should render —
-  // `authMode` defaults to 'token', so without this gate the token box flashes
-  // for every gateway (including OAuth ones) during the idle/probing window
-  // before the first probe lands. The scheme is known when either:
-  //   * the live probe finished (probeStatus 'done'), or
-  //   * we're idle but showing a previously-saved remote config (re-opening
-  //     settings for a gateway already signed-in or with a saved token), so
-  //     its control appears immediately with no flicker.
-  // While probing (or after a probe error), the scheme is unknown and we show
-  // the probe status row instead of a control.
   const hasSavedRemote = state.remoteTokenSet || state.remoteOauthConnected
 
-  const authResolved = useMemo(() => {
-    if (probeStatus === 'done') {
-      return true
-    }
-
-    return probeStatus === 'idle' && hasSavedRemote
-  }, [probeStatus, hasSavedRemote])
-
-  const providerLabel = useMemo(() => {
-    const providers: DesktopAuthProvider[] = probe?.providers ?? []
-
-    if (providers.length === 1) {
-      return providers[0].displayName || providers[0].name
-    }
-
-    if (providers.length > 1) {
-      return providers.map(p => p.displayName || p.name).join(' / ')
-    }
-
-    return t.boot.failure.identityProvider
-  }, [probe, t.boot.failure.identityProvider])
-
-  // A username/password gateway authenticates through a credential form on the
-  // gateway's /login page (POST /auth/password-login) rather than an OAuth
-  // redirect. Everything downstream — the session cookie, the ws-ticket mint,
-  // the persistent partition — is identical, so the desktop drives it through
-  // the same sign-in window; only the button copy changes. We treat the
-  // gateway as password-style only when EVERY advertised provider supports
-  // password, so a mixed deployment keeps the generic OAuth copy.
-  const isPasswordProvider = useMemo(() => {
-    const providers: DesktopAuthProvider[] = probe?.providers ?? []
-
-    return providers.length > 0 && providers.every(p => p.supportsPassword)
-  }, [probe])
+  const { authMode, authResolved, isPasswordProvider, probeStatus, providerLabel } = useRemoteAuthProbe({
+    enabled: state.mode === 'remote',
+    fallbackProviderLabel: t.boot.failure.identityProvider,
+    hasSavedRemote,
+    savedAuthMode: state.remoteAuthMode,
+    url: state.remoteUrl
+  })
 
   // The 'default' profile uses the global ("All profiles") connection, so the
   // per-profile scopes are the named, non-default profiles.

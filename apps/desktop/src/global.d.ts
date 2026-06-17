@@ -34,6 +34,10 @@ declare global {
       probeConnectionConfig: (remoteUrl: string) => Promise<DesktopConnectionProbeResult>
       oauthLoginConnectionConfig: (remoteUrl: string) => Promise<DesktopOauthLoginResult>
       oauthLogoutConnectionConfig: (remoteUrl?: string) => Promise<DesktopOauthLogoutResult>
+      // Remote ("Hermes Remote") flavor only: from the connect-first screen, opt
+      // into running a LOCAL backend instead. Persists the choice and reloads so
+      // the normal local bootstrap runs.
+      useLocalConnectionConfig: () => Promise<{ ok: boolean }>
       profile: {
         get: () => Promise<DesktopActiveProfile>
         // Persists the desktop's profile choice and relaunches the local

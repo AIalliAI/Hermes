@@ -83,6 +83,21 @@ export const en: Translations = {
       signInToRemoteGateway: 'Sign in to remote gateway',
       signInWithProvider: provider => `Sign in with ${provider}`,
       identityProvider: 'your identity provider'
+    },
+    connect: {
+      title: 'Connect to Hermes',
+      description:
+        'This is the standalone Hermes Remote client. Enter the address of a running Hermes gateway to get started.',
+      urlTitle: 'Gateway URL',
+      tokenTitle: 'Session token',
+      test: 'Test connection',
+      connect: 'Connect',
+      useLocal: 'Use a local backend instead',
+      useLocalHint: 'Run Hermes on this machine instead. The runtime is installed on first launch.',
+      connectFailed: 'Could not connect to the gateway',
+      enterUrlFirst: 'Enter a gateway URL first.',
+      signInRequired: 'Sign in before connecting.',
+      tokenRequired: 'Enter a session token before connecting.'
     }
   },
 

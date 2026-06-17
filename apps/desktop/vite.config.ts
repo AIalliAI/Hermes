@@ -3,8 +3,17 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'path'
 
+// Build flavor ('full' default | 'remote'). Each flavor runs its own `vite
+// build` (the dist:*:remote npm scripts set HERMES_DESKTOP_FLAVOR=remote), so
+// this compile-time define is flavor-correct per bundle. The electron main
+// process resolves the same value at runtime via electron/flavor.cjs.
+const HERMES_FLAVOR = process.env.HERMES_DESKTOP_FLAVOR === 'remote' ? 'remote' : 'full'
+
 export default defineConfig({
   base: './',
+  define: {
+    __HERMES_FLAVOR__: JSON.stringify(HERMES_FLAVOR)
+  },
   plugins: [react(), tailwindcss()],
   css: {
     // Pin an explicit (empty) PostCSS config. Tailwind is handled entirely by

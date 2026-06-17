@@ -97,6 +97,22 @@ export interface Translations {
       signInWithProvider: (provider: string) => string
       identityProvider: string
     }
+    // First-run connect-to-remote screen, shown by the standalone "Hermes
+    // Remote" flavor when no gateway is configured yet.
+    connect: {
+      title: string
+      description: string
+      urlTitle: string
+      tokenTitle: string
+      test: string
+      connect: string
+      useLocal: string
+      useLocalHint: string
+      connectFailed: string
+      enterUrlFirst: string
+      signInRequired: string
+      tokenRequired: string
+    }
   }
 
   notifications: {
