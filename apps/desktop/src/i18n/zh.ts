@@ -81,6 +81,20 @@ export const zh: Translations = {
       signInToRemoteGateway: '登录远程网关',
       signInWithProvider: provider => `使用 ${provider} 登录`,
       identityProvider: '你的身份提供方'
+    },
+    connect: {
+      title: '连接到 Hermes',
+      description: '这是独立的 Hermes Remote 客户端。请输入正在运行的 Hermes 网关地址以开始使用。',
+      urlTitle: '网关地址',
+      tokenTitle: '会话令牌',
+      test: '测试连接',
+      connect: '连接',
+      useLocal: '改用本地后端',
+      useLocalHint: '改为在本机运行 Hermes。首次启动时会安装运行时。',
+      connectFailed: '无法连接到网关',
+      enterUrlFirst: '请先输入网关地址。',
+      signInRequired: '连接前请先登录。',
+      tokenRequired: '连接前请先输入会话令牌。'
     }
   },
 

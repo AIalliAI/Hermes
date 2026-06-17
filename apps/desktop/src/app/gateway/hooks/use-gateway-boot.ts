@@ -359,10 +359,12 @@ export function useGatewayBoot({
         })
         await ensureDefaultWorkspaceCwd()
         const remoteDefault = await desktopDefaultCwd().catch(() => null)
+
         if (remoteDefault?.cwd && !$activeSessionId.get() && !$currentCwd.get()) {
           setCurrentCwd(remoteDefault.cwd)
           setCurrentBranch(remoteDefault.branch || '')
         }
+
         await callbacksRef.current.refreshHermesConfig()
 
         if (cancelled) {
@@ -378,12 +380,29 @@ export function useGatewayBoot({
         completeDesktopBoot()
         bootCompleted = true
       } catch (err) {
-        if (!cancelled) {
-          const message = err instanceof Error ? err.message : String(err)
-          failDesktopBoot(message)
-          notifyError(err, translateNow('boot.errors.desktopBootFailed'))
-          setSessionsLoading(false)
+        if (cancelled) {
+          return
         }
+
+        // Remote-flavor connect-first gate: getConnection() rejects because no
+        // gateway is configured yet. That is NOT a boot failure — the main
+        // process set the authoritative 'backend.needs-remote' phase and the
+        // RemoteConnectOverlay drives the user through configuring one. Re-read
+        // the snapshot (IPC errors don't carry custom props) and bail without
+        // flipping into the failure overlay.
+        const snapshot = await desktop.getBootProgress().catch(() => null)
+
+        if (snapshot?.phase === 'backend.needs-remote') {
+          applyDesktopBootProgress(snapshot)
+          setSessionsLoading(false)
+
+          return
+        }
+
+        const message = err instanceof Error ? err.message : String(err)
+        failDesktopBoot(message)
+        notifyError(err, translateNow('boot.errors.desktopBootFailed'))
+        setSessionsLoading(false)
       }
     }
 

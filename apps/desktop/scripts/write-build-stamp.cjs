@@ -36,6 +36,18 @@ const DESKTOP_ROOT = path.resolve(__dirname, "..")
 const REPO_ROOT = path.resolve(DESKTOP_ROOT, "..", "..")
 const OUT_DIR = path.join(DESKTOP_ROOT, "build")
 const OUT_FILE = path.join(OUT_DIR, "install-stamp.json")
+const FLAVOR_FILE = path.join(OUT_DIR, "flavor.json")
+
+// Persist the build flavor next to the install stamp so the packaged electron
+// main process can read it at runtime (electron/flavor.cjs), independent of any
+// build-time env that doesn't survive into the bundle. 'full' is the default;
+// the dist:*:remote npm scripts set HERMES_DESKTOP_FLAVOR=remote.
+function writeFlavorStamp() {
+  const flavor = process.env.HERMES_DESKTOP_FLAVOR === "remote" ? "remote" : "full"
+  fs.mkdirSync(OUT_DIR, { recursive: true })
+  fs.writeFileSync(FLAVOR_FILE, JSON.stringify({ flavor }, null, 2) + "\n", "utf8")
+  console.log("[write-build-stamp] wrote " + path.relative(REPO_ROOT, FLAVOR_FILE) + " -> " + flavor)
+}
 
 function tryExec(cmd, opts) {
   try {
@@ -121,6 +133,8 @@ function main() {
       (stamp.branch ? " (" + stamp.branch + ")" : "") +
       (stamp.dirty ? " [DIRTY]" : "")
   )
+
+  writeFlavorStamp()
 }
 
 main()

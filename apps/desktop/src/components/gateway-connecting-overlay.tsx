@@ -58,7 +58,10 @@ export function GatewayConnectingOverlay() {
   // the chat then — users should still be able to type drafts, open settings,
   // and recover instead of staring at a modal CONNECTING screen.
   const initialBootActive = boot.visible || boot.running || boot.progress < 100
-  const connecting = gatewayState !== 'open' && !boot.error && initialBootActive
+  // The remote flavor's connect-first screen (RemoteConnectOverlay) owns the
+  // screen while we wait for a gateway URL — don't show CONNECTING behind it.
+  const awaitingRemoteConfig = boot.phase === 'backend.needs-remote'
+  const connecting = gatewayState !== 'open' && !boot.error && initialBootActive && !awaitingRemoteConfig
   // Latches once we've actually shown the overlay, so the brief frame where
   // gatewayState flips to "open" (connecting -> false) before the exit phase
   // kicks in doesn't unmount us and cause a flash.

@@ -29,11 +29,17 @@ exports.default = async function afterPack(context) {
   }
 
   const productName = context.packager?.appInfo?.productFilename || 'Hermes'
+  // Human-facing product name for the version-string metadata. productFilename
+  // preserves interior spaces (sanitize-filename only strips filesystem-illegal
+  // chars + trailing dots/spaces), so for our flavors it already equals
+  // productName ("Hermes" / "Hermes Remote"); displayName is kept distinct only
+  // as a defensive fallback for the version strings.
+  const displayName = context.packager?.appInfo?.productName || productName
   const exe = path.join(context.appOutDir, `${productName}.exe`)
   const desktopRoot = path.resolve(__dirname, '..')
 
   try {
-    await stampExeIdentity(exe, desktopRoot)
+    await stampExeIdentity(exe, desktopRoot, { productName: displayName })
   } catch (err) {
     // Never fail the build over a cosmetic stamp.
     console.warn(`[after-pack] exe identity stamp failed (${err.message}); Hermes.exe keeps the stock Electron icon`)

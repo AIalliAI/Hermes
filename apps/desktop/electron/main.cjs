@@ -54,6 +54,7 @@ const {
   uninstallArgsForMode
 } = require('./desktop-uninstall.cjs')
 const { isPackagedInstallPath: isPackagedInstallPathUnderRoots } = require('./workspace-cwd.cjs')
+const { flavorIdentity, isRemoteFlavor, resolveFlavor } = require('./flavor.cjs')
 const {
   authModeFromStatus,
   buildGatewayWsUrl,
@@ -214,6 +215,25 @@ function loadInstallStamp() {
   return null
 }
 const INSTALL_STAMP = loadInstallStamp()
+
+// DESKTOP_FLAVOR — which product variant this build is ('full' | 'remote').
+// Fixed at build time (see flavor.cjs). The 'remote' flavor ("Hermes Remote")
+// is a standalone client that connects to a remote gateway and, on first run
+// with no connection configured, shows a connect-first screen instead of
+// bootstrapping a local backend (a local backend remains an opt-in). Resolved
+// from the env (dev / dist:*:remote scripts) or a bundled flavor.json shipped
+// via extraResources — same candidate-path shape as the install stamp above.
+const DESKTOP_FLAVOR = resolveFlavor({
+  env: process.env.HERMES_DESKTOP_FLAVOR,
+  candidatePaths: [
+    process.resourcesPath ? path.join(process.resourcesPath, 'flavor.json') : null,
+    path.join(APP_ROOT, 'build', 'flavor.json')
+  ]
+})
+const IS_REMOTE_FLAVOR = isRemoteFlavor(DESKTOP_FLAVOR)
+const FLAVOR_IDENTITY = flavorIdentity(DESKTOP_FLAVOR)
+console.log(`[hermes] desktop flavor: ${DESKTOP_FLAVOR}`)
+
 if (INSTALL_STAMP) {
   console.log(
     `[hermes] install stamp: ${INSTALL_STAMP.commit.slice(0, 12)}${INSTALL_STAMP.branch ? ` (${INSTALL_STAMP.branch})` : ''}${INSTALL_STAMP.dirty ? ' [DIRTY]' : ''} from ${INSTALL_STAMP.source || 'unknown'}`
@@ -333,7 +353,11 @@ const BOOT_FAKE_STEP_MS = (() => {
   if (!Number.isFinite(raw) || raw <= 0) return 650
   return Math.max(120, raw)
 })()
-const APP_NAME = 'Hermes'
+// Flavor-derived so a remote build's in-app macOS menu + About panel read
+// "Hermes Remote", matching the OS-level CFBundleName set by electron-builder.
+// Does NOT affect userData/keychain isolation (those derive from the packaged
+// appId/productName, resolved before app.setName runs).
+const APP_NAME = FLAVOR_IDENTITY.productName
 const TITLEBAR_HEIGHT = 34
 const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
 const WINDOW_BUTTON_POSITION = {
@@ -4101,7 +4125,7 @@ function readDesktopConnectionConfig() {
     return connectionConfigCache
   }
 
-  let config = { mode: 'local', remote: {}, profiles: {} }
+  let config = { mode: 'local', remote: {}, profiles: {}, localOptIn: false }
 
   try {
     const raw = fs.readFileSync(DESKTOP_CONNECTION_CONFIG_PATH, 'utf8')
@@ -4119,7 +4143,11 @@ function readDesktopConnectionConfig() {
         // Per-profile remote overrides: each profile may point at its own
         // backend (local spawn or its own remote URL). Preserved verbatim so
         // profileRemoteOverride() can resolve them; normalized lazily on save.
-        profiles: sanitizeConnectionProfiles(parsed.profiles)
+        profiles: sanitizeConnectionProfiles(parsed.profiles),
+        // Remote-flavor only: the user explicitly chose to run a LOCAL backend
+        // from the connect-first screen, so the remote-first gate steps aside.
+        // Ignored by the full flavor. See remoteFirstGateActive().
+        localOptIn: Boolean(parsed.localOptIn)
       }
     }
   } catch {
@@ -4251,7 +4279,12 @@ function coerceDesktopConnectionConfig(input = {}, existing = readDesktopConnect
     } else {
       delete profiles[key]
     }
-    return { mode: existing.mode === 'remote' ? 'remote' : 'local', remote: existing.remote || {}, profiles }
+    return {
+      mode: existing.mode === 'remote' ? 'remote' : 'local',
+      remote: existing.remote || {},
+      profiles,
+      localOptIn: Boolean(existing.localOptIn)
+    }
   }
 
   const nextRemote =
@@ -4259,8 +4292,9 @@ function coerceDesktopConnectionConfig(input = {}, existing = readDesktopConnect
       ? buildRemoteBlock(remoteUrl, authMode, nextToken)
       : { url: remoteUrl ? normalizeRemoteBaseUrl(remoteUrl) : remoteUrl, authMode, token: nextToken }
 
-  // Preserve per-profile overrides when saving the global connection.
-  return { mode, remote: nextRemote, profiles: existing.profiles || {} }
+  // Preserve per-profile overrides (and any local opt-in) when saving the
+  // global connection.
+  return { mode, remote: nextRemote, profiles: existing.profiles || {}, localOptIn: Boolean(existing.localOptIn) }
 }
 
 // Build a remote backend connection descriptor from an already-resolved remote
@@ -4381,6 +4415,23 @@ function profileHasRemoteOverride(profile) {
 function configuredRemoteProfileNames() {
   const config = readDesktopConnectionConfig()
   return Object.keys(config.profiles || {}).filter(name => profileRemoteOverride(config, name))
+}
+
+// True when the user has explicitly opted into a LOCAL backend from the
+// remote-flavor connect-first screen (persisted as connection.json
+// `localOptIn`). Lets the remote-first gate step aside so the normal local
+// bootstrap path runs. Meaningless in the full flavor.
+function localOptInActive() {
+  return Boolean(readDesktopConnectionConfig().localOptIn)
+}
+
+// True when the standalone "remote" flavor should show its connect-first screen
+// instead of bootstrapping a local backend: the build is the remote flavor, no
+// remote is configured (env / global / per-profile all absent — the caller has
+// already confirmed resolveRemoteBackend() returned null), and the user has not
+// opted into a local backend. The full flavor never gates (always false).
+function remoteFirstGateActive() {
+  return IS_REMOTE_FLAVOR && !localOptInActive()
 }
 
 // True when the app is in app-global remote mode (Settings → "All profiles" →
@@ -4899,6 +4950,29 @@ async function startHermes() {
       }
     }
 
+    // Remote-flavor connect-first gate: a standalone "Hermes Remote" build with
+    // nothing configured must NOT bootstrap a local Python backend. Surface a
+    // 'backend.needs-remote' boot phase and stop here; the renderer shows the
+    // connect screen, which writes connection.json mode:remote and reloads —
+    // re-entering startHermes(), where resolveRemoteBackend() then succeeds. The
+    // user can instead opt into a local backend (hermes:connection-config:use-local),
+    // which sets localOptIn and falls through to the bootstrap path below.
+    if (remoteFirstGateActive()) {
+      updateBootProgress(
+        {
+          phase: 'backend.needs-remote',
+          message: 'Connect to a remote Hermes gateway to get started',
+          progress: 0,
+          running: false,
+          error: null
+        },
+        { allowDecrease: true }
+      )
+      const err = new Error('Remote Hermes is not configured yet.')
+      err.needsRemoteConfig = true
+      throw err
+    }
+
     const token = crypto.randomBytes(32).toString('base64url')
     // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
     const dashboardArgs = ['dashboard', '--no-open', '--host', '127.0.0.1', '--port', '0']
@@ -5027,6 +5101,14 @@ async function startHermes() {
       ...getWindowState()
     }
   })().catch(error => {
+    // The remote-first gate is not a failure: keep the 'backend.needs-remote'
+    // boot phase it set so the renderer shows the connect screen instead of a
+    // boot-failure overlay. Just clear the cached promise so a later retry
+    // (after the user configures a remote or opts into local) re-runs.
+    if (error && error.needsRemoteConfig) {
+      connectionPromise = null
+      throw error
+    }
     const message = error instanceof Error ? error.message : String(error)
     updateBootProgress(
       {
@@ -5443,6 +5525,23 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   }
 
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
+})
+
+// Remote-flavor connect-first escape hatch: the user chose "Use a local backend
+// instead" from the connect screen. Persist the opt-in so remoteFirstGateActive()
+// steps aside, clear any latched bootstrap failure, then re-home — reload runs
+// startHermes(), which now falls through to the normal local bootstrap path.
+ipcMain.handle('hermes:connection-config:use-local', async () => {
+  const config = readDesktopConnectionConfig()
+  config.localOptIn = true
+  // A leftover global-remote mode would short-circuit before the local path;
+  // force local so the bootstrap actually runs.
+  config.mode = 'local'
+  writeDesktopConnectionConfig(config)
+  bootstrapFailure = null
+  await teardownPrimaryBackendAndWait()
+  mainWindow?.reload()
+  return { ok: true }
 })
 
 ipcMain.handle('hermes:profile:get', async () => ({ profile: readActiveDesktopProfile() }))
@@ -6400,7 +6499,9 @@ ipcMain.handle('hermes:vscode-theme:search', async (_event, query) => searchMark
 // running app's chat composer. Three delivery paths: macOS 'open-url',
 // Win/Linux running-app 'second-instance' (argv), Win/Linux cold-start argv.
 // ---------------------------------------------------------------------------
-const HERMES_PROTOCOL = 'hermes'
+// Per flavor so two installed apps can't both claim the same OS-wide scheme
+// ('hermes' for the full app, 'hermes-remote' for the standalone client).
+const HERMES_PROTOCOL = FLAVOR_IDENTITY.protocol
 let _pendingDeepLink = null
 let _rendererReadyForDeepLink = false
 

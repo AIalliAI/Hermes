@@ -38,13 +38,17 @@
 const path = require('node:path')
 const fs = require('node:fs')
 
-// Stamp the Hermes icon + identity onto `exe`. Resolves on success, throws on
-// failure. `desktopRoot` defaults to this script's package root so the icon and
-// the rcedit dependency resolve regardless of cwd.
-async function stampExeIdentity(exe, desktopRoot = path.resolve(__dirname, '..')) {
+// Stamp the icon + identity onto `exe`. Resolves on success, throws on failure.
+// `desktopRoot` defaults to this script's package root so the icon and the
+// rcedit dependency resolve regardless of cwd. `identity` overrides the product
+// strings so flavored builds (e.g. "Hermes Remote") stamp their own name;
+// defaults keep the standard "Hermes" identity unchanged.
+async function stampExeIdentity(exe, desktopRoot = path.resolve(__dirname, '..'), identity = {}) {
   if (!exe || !fs.existsSync(exe)) {
     throw new Error(`target exe not found: ${exe}`)
   }
+
+  const productName = identity.productName || 'Hermes'
 
   // Icon lives at apps/desktop/assets/icon.ico
   const icon = path.join(desktopRoot, 'assets', 'icon.ico')
@@ -68,14 +72,14 @@ async function stampExeIdentity(exe, desktopRoot = path.resolve(__dirname, '..')
   await rcedit(exe, {
     icon,
     'version-string': {
-      ProductName: 'Hermes',
-      FileDescription: 'Hermes',
+      ProductName: productName,
+      FileDescription: productName,
       CompanyName: 'Nous Research',
       LegalCopyright: 'Copyright (c) 2026 Nous Research'
     }
   })
 
-  console.log('[set-exe-identity] done — Hermes icon + identity stamped')
+  console.log(`[set-exe-identity] done — ${productName} icon + identity stamped`)
 }
 
 module.exports = { stampExeIdentity }
