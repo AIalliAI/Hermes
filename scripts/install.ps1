@@ -2329,8 +2329,32 @@ function Install-Desktop {
         }
         $ErrorActionPreference = $prevEAP
         if ($code -ne 0) {
-            Show-NpmCertHint ($npmOut -join "`n") | Out-Null
-            throw "desktop workspace npm install failed (exit $code) -- see lines above for cause"
+            # The usual cause is electron's postinstall binary download being
+            # blocked/throttled: its install.js does process.exit(1) on a failed
+            # download, which fails the whole `npm ci`/`npm install` (#47266,
+            # #47917). npm runs postinstall scripts LAST -- after every package is
+            # already staged on disk -- so when the binary download is the
+            # casualty the only thing missing is the desktop workspace's
+            # electron\dist. Repopulate it via electron's own downloader
+            # (canonical source first, then the public mirror when the user hasn't
+            # pinned one) and carry on to the build; the mirror self-heal after
+            # `pack` below is otherwise unreachable on a blocked network because
+            # this install step throws first. Restore-ElectronDist resolves the
+            # right package dir via Get-ElectronDir (#48081).
+            $depsRepaired = $false
+            if (-not (Test-ElectronDist -InstallDir $InstallDir)) {
+                if (Restore-ElectronDist -InstallDir $InstallDir) {
+                    $depsRepaired = $true
+                } elseif ((-not $env:ELECTRON_MIRROR) -and (Restore-ElectronDist -InstallDir $InstallDir -Mirror "https://npmmirror.com/mirrors/electron/")) {
+                    $depsRepaired = $true
+                }
+            }
+            if ($depsRepaired) {
+                Write-Warn "Dependency install failed on the Electron binary download; repopulated the desktop Electron dist via a mirror and continuing."
+            } else {
+                Show-NpmCertHint ($npmOut -join "`n") | Out-Null
+                throw "desktop workspace npm install failed (exit $code) -- see lines above for cause"
+            }
         }
         Write-Success "Desktop workspace dependencies installed"
     } catch {
