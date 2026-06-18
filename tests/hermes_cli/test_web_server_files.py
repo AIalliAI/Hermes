@@ -194,6 +194,9 @@ def test_local_mode_defaults_to_home_and_can_jump_to_absolute_path(local_files_c
 
 
 def test_gated_local_mode_still_defaults_to_home(monkeypatch, tmp_path):
+    # Auth-gated host installs accessed from a remote IP should be confined to
+    # the user's home directory (locked_root=home) so that the Files page stays
+    # safe over the LAN without the /opt/data assumption (#44116).
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.delenv("HERMES_DASHBOARD_FILES_ROOT", raising=False)
@@ -216,8 +219,8 @@ def test_gated_local_mode_still_defaults_to_home(monkeypatch, tmp_path):
         _restore_app_state(prev_auth_required, prev_bound_host)
 
     assert policy.default_path == home.resolve()
-    assert policy.locked_root is None
-    assert policy.can_change_path is True
+    assert policy.locked_root == home.resolve()
+    assert policy.can_change_path is False
 
 
 def test_local_mode_upload_read_mkdir_delete_roundtrip(local_files_client):
