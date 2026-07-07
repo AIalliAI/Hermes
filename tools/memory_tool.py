@@ -130,8 +130,11 @@ class MemoryStore:
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
-        self.memory_char_limit = memory_char_limit
-        self.user_char_limit = user_char_limit
+        # Clamp negative limits to 0 so the store doesn't silently enter a
+        # permanently read-only state (new_total > negative_limit always True).
+        # Hermes maintenance fleet Bug-Hunt P0-2 fix.
+        self.memory_char_limit = max(0, memory_char_limit)
+        self.user_char_limit = max(0, user_char_limit)
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
         # Per-turn counter of failed at-capacity consolidation attempts; reset
