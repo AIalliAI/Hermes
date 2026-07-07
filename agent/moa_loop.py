@@ -11,10 +11,11 @@ from __future__ import annotations
 import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Callable
 
 from agent.auxiliary_client import call_llm
 from agent.transports import get_transport
+from agent.model_metadata import get_model_context_length, estimate_messages_tokens_rough
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +224,7 @@ def _run_reference(
     *,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    on_failure: Callable[[str, Exception], None] | None = None,
 ) -> tuple[str, str, Any]:
     """Call one reference model and return ``(label, text, usage)``.
 
@@ -270,6 +272,25 @@ def _run_reference(
         # (their caching is automatic; markers are ignored harmlessly, but we
         # only decorate when the policy says the route honors them).
         messages = _maybe_apply_moa_cache_control(messages, runtime)
+        # Check if messages exceed the reference model's context window and trim if necessary
+        try:
+            model_id = slot.get("model") or ""
+            context_length = get_model_context_length(model_id, 
+                                                    base_url=runtime.get("base_url"),
+                                                    api_key=runtime.get("api_key"))
+            if context_length and context_length > 0:
+                # Estimate tokens in the messages
+                estimated_tokens = estimate_messages_tokens_rough(messages)
+                if estimated_tokens > context_length:
+                    logger.warning(
+                        "MoA reference model %s context overflow: estimated %d tokens > %d limit. Trimming messages.",
+                        label, estimated_tokens, context_length
+                    )
+                    # Trim messages to fit within context, preserving system prompt and most recent messages
+                    messages = _trim_messages_to_context(messages, context_length)
+        except Exception as trim_exc:
+            logger.debug("Context trimming check failed for %s: %s", label, trim_exc)
+        
         response = call_llm(
             task="moa_reference",
             messages=messages,
@@ -323,6 +344,11 @@ def _run_reference(
         return label, _output_text, acct
     except Exception as exc:
         logger.warning("MoA reference model %s failed: %s", label, exc)
+        if on_failure:
+            try:
+                on_failure(label, exc)
+            except Exception:
+                pass  # Failure callback should not raise
         return label, f"[failed: {exc}]", _RefAccounting(
             CanonicalUsage(),
             messages=[{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages],
@@ -339,6 +365,7 @@ def _run_references_parallel(
     *,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    on_reference_failure: Callable[[str, Exception], None] | None = None,
 ) -> list[tuple[str, str, Any]]:
     """Fan out all reference models in parallel, returning outputs in order.
 
@@ -432,6 +459,53 @@ _ADVISORY_INSTRUCTION = (
     "what risks or mistakes you see, and how the acting agent should "
     "proceed.]"
 )
+
+
+
+def _trim_messages_to_context(messages: list[dict[str, Any]], context_length: int) -> list[dict[str, Any]]:
+    """Trim messages to fit within the model's context window.
+    
+    Preserves the system prompt (first message if it's a system message) and
+    removes oldest messages from the middle until the estimated token count
+    is within limits. Uses binary search for efficiency.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    if not messages or len(messages) <= 1:
+        return messages
+    
+    # Always preserve system prompt (first message)
+    system_msg = messages[0] if messages[0].get("role") == "system" else None
+    other_msgs = messages[1:] if system_msg else messages
+    
+    if not other_msgs:
+        return messages
+    
+    # Binary search for the maximum number of messages we can keep
+    lo, hi = 0, len(other_msgs)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        candidate = ([system_msg] if system_msg else []) + other_msgs[-mid:]
+        if estimate_messages_tokens_rough(candidate) <= context_length:
+            lo = mid
+        else:
+            hi = mid - 1
+    
+    # If we can't fit any messages, just return the system message (or empty)
+    if lo == 0:
+        logger.warning("Could not fit any messages within context length %d", context_length)
+        return [system_msg] if system_msg else []
+    
+    # Return system prompt + last lo messages
+    result = ([system_msg] if system_msg else []) + other_msgs[-lo:]
+    
+    logger.debug(
+        "Trimmed messages from %d to %d to fit context length %d",
+        len(messages), len(result), context_length
+    )
+    
+    return result
 
 
 def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
