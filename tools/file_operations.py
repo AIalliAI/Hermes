@@ -1405,6 +1405,26 @@ class ShellFileOperations(FileOperations):
             if mkdir_result.exit_code == 0:
                 dirs_created = True
 
+        # Pre-write in-process syntax gate for JSON, YAML, and TOML.
+        # Run the parse BEFORE _atomic_write so invalid content is
+        # rejected before any bytes hit disk.  Scoped to structured
+        # formats only — Python is excluded because the test suite
+        # writes non-Python text through *.py paths as generic
+        # write-mechanics fixtures.
+        if ext in LINTERS_INPROC and ext != '.py':
+            inproc = LINTERS_INPROC[ext]
+            if inproc is not None:
+                ok, err = inproc(content)
+                if not ok:
+                    return WriteResult(
+                        error=(
+                            f"Syntax error in {path}: {err} — "
+                            f"file was NOT written (content rejected "
+                            f"before reaching disk)."
+                        ),
+                        lint={"status": "error", "output": err},
+                    )
+
         # Write atomically: stream into a temp file in the SAME directory,
         # then ``mv`` it over the target. The rename is atomic on POSIX
         # (and on every backend FS we run on), so a crash / power loss /
