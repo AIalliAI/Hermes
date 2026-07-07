@@ -262,7 +262,7 @@ export async function listAllProfileSessions(
 // that hit the local primary would no-op or 404. Omit for the current/default.
 export function setSessionArchived(id: string, archived: boolean, profile?: string | null): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
-    ...(profile ? { profile } : {}),
+    ...(profile ? { profile } : profileScoped()),
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'PATCH',
     body: { archived }
@@ -283,7 +283,7 @@ export function getSession(id: string, profile?: string | null): Promise<Session
   const suffix = profile ? `?profile=${encodeURIComponent(profile)}` : ''
 
   return window.hermesDesktop.api<SessionInfo>({
-    ...(profile ? { profile } : {}),
+    ...(profile ? { profile } : profileScoped()),
     path: `/api/sessions/${encodeURIComponent(id)}${suffix}`
   })
 }
@@ -296,14 +296,14 @@ export function getSessionMessages(id: string, profile?: string | null): Promise
   const suffix = profile ? `?profile=${encodeURIComponent(profile)}` : ''
 
   return window.hermesDesktop.api<SessionMessagesResponse>({
-    ...(profile ? { profile } : {}),
+    ...(profile ? { profile } : profileScoped()),
     path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`
   })
 }
 
 export function deleteSession(id: string, profile?: string | null): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
-    ...(profile ? { profile } : {}),
+    ...(profile ? { profile } : profileScoped()),
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'DELETE'
   })
@@ -315,7 +315,7 @@ export function renameSession(
   profile?: string | null
 ): Promise<{ ok: boolean; title: string }> {
   return window.hermesDesktop.api<{ ok: boolean; title: string }>({
-    ...(profile ? { profile } : {}),
+    ...(profile ? { profile } : profileScoped()),
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'PATCH',
     body: { title, ...(profile ? { profile } : {}) }
