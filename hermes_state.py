@@ -1552,11 +1552,11 @@ class SessionDB:
                     (SCHEMA_VERSION,),
                 )
 
-        # Unique title index — always ensure it exists
+        # Unique title index — scoped by source and archived status
         try:
             cursor.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
-                "ON sessions(title) WHERE title IS NOT NULL"
+                "ON sessions(source, title, archived) WHERE title IS NOT NULL"
             )
         except sqlite3.OperationalError:
             pass  # Index already exists
@@ -2709,8 +2709,8 @@ class SessionDB:
             if title:
                 # Check uniqueness (allow the same session to keep its own title)
                 cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE title = ? AND id != ?",
-                    (title, session_id),
+                    "SELECT id FROM sessions WHERE title = ? AND id != ? AND source = (SELECT source FROM sessions WHERE id = ?) AND (archived IS NULL OR archived = 0)",
+                    (title, session_id, session_id),
                 )
                 conflict = cursor.fetchone()
                 if conflict:
