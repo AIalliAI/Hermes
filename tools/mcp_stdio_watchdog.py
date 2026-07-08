@@ -159,12 +159,18 @@ def main(argv: list[str] | None = None) -> int:
     # (`_kill_orphaned_mcp_children`, shutdown sweeps) still kills a wedged
     # server that ignores stdin EOF — otherwise the watchdog wrap would
     # invert the bug it fixes.
-    def _forward_shutdown(signum, frame):  # noqa: ARG001
-        _terminate_process_group(proc)
-        sys.exit(128 + signum)
+    #
+    # #61010: Signal handlers MUST NOT call proc.wait() because the main
+    # thread is already blocking in proc.wait() — nested waitpid on the
+    # same process causes a race condition. Instead, set a flag and let
+    # the main polling loop handle termination outside signal context.
+    _shutdown_requested = threading.Event()
 
-    signal.signal(signal.SIGTERM, _forward_shutdown)
-    signal.signal(signal.SIGINT, _forward_shutdown)
+    def _flag_shutdown(signum, frame):  # noqa: ARG001
+        _shutdown_requested.set()
+
+    signal.signal(signal.SIGTERM, _flag_shutdown)
+    signal.signal(signal.SIGINT, _flag_shutdown)
 
     watchdog = threading.Thread(
         target=_watchdog_loop,
@@ -174,7 +180,18 @@ def main(argv: list[str] | None = None) -> int:
     watchdog.start()
 
     try:
-        return proc.wait()
+        # Poll instead of blocking wait — lets us check the shutdown flag
+        # and the orphan-detection thread on the main thread where it's
+        # safe to call _terminate_process_group.
+        while proc.poll() is None:
+            if _shutdown_requested.is_set():
+                _terminate_process_group(proc)
+                return 128 + signal.SIGTERM
+            if _is_orphaned(args.ppid, args.create_time):
+                _terminate_process_group(proc)
+                return 0
+            time.sleep(_POLL_INTERVAL_S)
+        return proc.returncode
     except KeyboardInterrupt:
         _terminate_process_group(proc)
         return 130
