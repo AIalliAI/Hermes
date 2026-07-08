@@ -10596,7 +10596,13 @@ async def auth_mcp_server(name: str, profile: Optional[str] = None):
             try:
                 from tools.mcp_oauth_manager import get_manager
 
-                get_manager().remove(name)
+                # #60694: keep tokens on disk during re-auth probe —
+                # only evict the in-memory cache. If the OAuth server is
+                # transiently unreachable (not invalid credentials), the
+                # SDK reloads the still-valid tokens from disk on next
+                # connect. If the tokens ARE invalid, the SDK's normal
+                # auth flow will refresh or re-prompt.
+                get_manager().remove(name, keep_tokens=True)
             except Exception:
                 pass  # No cached state to clear — fine.
             try:

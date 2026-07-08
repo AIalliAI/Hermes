@@ -556,14 +556,28 @@ class MCPOAuthManager:
             timeout=float(cfg.get("timeout", 300)),
         )
 
-    def remove(self, server_name: str) -> None:
-        """Evict the provider from cache AND delete tokens from disk.
+    def remove(self, server_name: str, *, keep_tokens: bool = False) -> None:
+        """Evict the provider from cache and (by default) delete tokens from disk.
 
         Called by ``hermes mcp remove <name>`` and (indirectly) by
         ``hermes mcp login <name>`` during forced re-auth.
+
+        When *keep_tokens* is True (used by re-auth flows during transient
+        outages), only the in-memory provider cache is evicted — tokens on
+        disk survive so the SDK can reload them on next connect. This
+        prevents permanent credential loss when a probe fails due to a
+        transient network issue rather than invalid credentials (#60694).
         """
         with self._entries_lock:
             self._entries.pop(server_name, None)
+
+        if keep_tokens:
+            logger.info(
+                "MCP OAuth '%s': evicted from cache "
+                "(tokens preserved on disk — transient reconnect)",
+                server_name,
+            )
+            return
 
         from tools.mcp_oauth import remove_oauth_tokens
         remove_oauth_tokens(server_name)
