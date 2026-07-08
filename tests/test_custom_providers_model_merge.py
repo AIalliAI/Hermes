@@ -11,28 +11,25 @@ def test_configured_models_merged_with_live_models():
     from hermes_cli.model_switch import list_authenticated_providers
     
     configured_models = [
-        {"slug": "configured-model-1", "name": "Configured Model 1"},
-        {"slug": "configured-model-2", "name": "Configured Model 2"}
+        {"id": "configured-model-1", "name": "Configured Model 1"},
+        {"id": "configured-model-2", "name": "Configured Model 2"}
     ]
-    live_models = [
-        {"slug": "live-model-1", "name": "Live Model 1"},
-        {"slug": "live-model-2", "name": "Live Model 2"}
-    ]
+    # fetch_api_models returns list[str] — model slugs
+    live_models = ["live-model-1", "live-model-2"]
     
-    # Patch fetch_api_models in hermes_cli.model_switch (where it's imported locally)
     with patch('hermes_cli.models.fetch_api_models', return_value=live_models):
         providers = list_authenticated_providers(
             custom_providers=[
                 {
                     "name": "Test Provider",
                     "api": "http://localhost:9999/v1",
+                    "api_key": "sk-test",
                     "models": configured_models,
                     "discover_models": True
                 }
             ]
         )
     
-    # Find our test provider
     test_provider = None
     for p in providers:
         if p.get("name") == "Test Provider":
@@ -42,9 +39,9 @@ def test_configured_models_merged_with_live_models():
     assert test_provider is not None, "Test provider not found in results"
     
     result_models = test_provider.get("models", [])
-    result_slugs = {m.get("slug") for m in result_models}
+    # After merge, models_list contains strings (declared_model_ids) + live strings
+    result_slugs = {m if isinstance(m, str) else m.get("slug", m.get("id", "")) for m in result_models}
     
-    # Should contain BOTH configured and live models
     assert "configured-model-1" in result_slugs, "Configured model 1 missing"
     assert "configured-model-2" in result_slugs, "Configured model 2 missing"
     assert "live-model-1" in result_slugs, "Live model 1 missing"
@@ -57,16 +54,16 @@ def test_configured_models_preserved_when_live_discovery_fails():
     from hermes_cli.model_switch import list_authenticated_providers
     
     configured_models = [
-        {"slug": "configured-only", "name": "Configured Only"}
+        {"id": "configured-only", "name": "Configured Only"}
     ]
     
-    # Mock fetch_api_models to raise an exception
     with patch('hermes_cli.models.fetch_api_models', side_effect=Exception("Network error")):
         providers = list_authenticated_providers(
             custom_providers=[
                 {
                     "name": "Test Provider 2",
                     "api": "http://localhost:9998/v1",
+                    "api_key": "sk-test",
                     "models": configured_models,
                     "discover_models": True
                 }
@@ -82,7 +79,8 @@ def test_configured_models_preserved_when_live_discovery_fails():
     assert test_provider is not None
     result_models = test_provider.get("models", [])
     assert len(result_models) == 1, "Configured models should be preserved when discovery fails"
-    assert result_models[0].get("slug") == "configured-only"
+    # _declared_model_ids extracts "id" from dict, so result is string
+    assert result_models[0] == "configured-only"
 
 
 def test_no_duplicates_when_live_returns_same_model():
@@ -92,13 +90,10 @@ def test_no_duplicates_when_live_returns_same_model():
     from hermes_cli.model_switch import list_authenticated_providers
     
     configured_models = [
-        {"slug": "shared-model", "name": "Shared Model"},
-        {"slug": "only-configured", "name": "Only Configured"}
+        {"id": "shared-model", "name": "Shared Model"},
+        {"id": "only-configured", "name": "Only Configured"}
     ]
-    live_models = [
-        {"slug": "shared-model", "name": "Shared Model Live"},
-        {"slug": "only-live", "name": "Only Live"}
-    ]
+    live_models = ["shared-model", "only-live"]
     
     with patch('hermes_cli.models.fetch_api_models', return_value=live_models):
         providers = list_authenticated_providers(
@@ -106,6 +101,7 @@ def test_no_duplicates_when_live_returns_same_model():
                 {
                     "name": "Test Provider 3",
                     "api": "http://localhost:9997/v1",
+                    "api_key": "sk-test",
                     "models": configured_models,
                     "discover_models": True
                 }
@@ -120,7 +116,7 @@ def test_no_duplicates_when_live_returns_same_model():
     
     assert test_provider is not None
     result_models = test_provider.get("models", [])
-    result_slugs = [m.get("slug") for m in result_models]
+    result_slugs = [m if isinstance(m, str) else m.get("slug", m.get("id", "")) for m in result_models]
     
     # shared-model should appear only once
     assert result_slugs.count("shared-model") == 1, "Duplicate model found"
