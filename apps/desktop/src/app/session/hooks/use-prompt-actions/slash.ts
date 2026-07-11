@@ -29,9 +29,19 @@ import {
   setYoloActive
 } from '@/store/session'
 
-import type { BrowserManageResponse, SessionTitleResponse, SlashExecResponse } from '../../../types'
+import type {
+  BrowserManageResponse,
+  SessionCompressResponse,
+  SessionTitleResponse,
+  SlashExecResponse
+} from '../../../types'
 
 import { type GatewayRequest, isSessionIdCandidate, renderCommandsCatalog, slashStatusText } from './utils'
+
+// Manual compression is LLM-bound and routinely outlives the desktop's 30s
+// default WS request timeout on large sessions — give it the TUI client's
+// 120s RPC budget (HERMES_TUI_RPC_TIMEOUT_MS default) instead.
+const SESSION_COMPRESS_TIMEOUT_MS = 120_000
 
 /** Everything a slash handler needs about the invocation it's serving. */
 interface SlashActionCtx {
@@ -128,6 +138,8 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           return
         }
 
+        let slashExecError: unknown = null
+
         const handleDispatch = async (
           dispatch: NonNullable<ReturnType<typeof parseCommandDispatch>>
         ): Promise<void> => {
@@ -203,8 +215,11 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           renderSlashOutput(output?.warning ? `warning: ${output.warning}\n${body}` : body)
 
           return
-        } catch {
-          // Fall back to command.dispatch for skill/send/alias directives.
+        } catch (error) {
+          // Fall back to command.dispatch for skill/send/alias directives. Keep
+          // the original error: a slash.exec worker timeout/crash is the real
+          // failure, not the "not a quick/plugin/skill command" routing noise.
+          slashExecError = error
         }
 
         try {
@@ -220,7 +235,19 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
           await handleDispatch(dispatch)
         } catch (err) {
-          renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
+          // "not a quick/plugin/skill command" just means the fallback had
+          // nothing to add — the slash.exec failure (worker timeout, crash) is
+          // the real error, so don't bury it under the routing noise.
+          const dispatchMessage = err instanceof Error ? err.message : String(err)
+
+          const original =
+            slashExecError && dispatchMessage.includes('not a quick/plugin/skill command')
+              ? slashExecError instanceof Error
+                ? slashExecError.message
+                : String(slashExecError)
+              : ''
+
+          renderSlashOutput(`error: ${original ? `/${name} failed: ${original}` : dispatchMessage}`)
         }
       }
 
@@ -233,6 +260,50 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         },
         branch: async () => {
           await branchCurrentSession()
+        },
+        // /compress runs the gateway's dedicated session.compress RPC — the
+        // same path the TUI uses (ui-tui slash/commands/session.ts). It must
+        // NOT go through runExec: compressing a large session outlives the
+        // slash worker's pipe timeout, and the resulting slash.exec error used
+        // to cascade into command.dispatch's misleading "not a
+        // quick/plugin/skill command: compress" (#44456).
+        compress: async ctx => {
+          const resolved = await withSlashOutput(ctx)
+
+          if (!resolved) {
+            return
+          }
+
+          const { render: renderSlashOutput, sessionId } = resolved
+          const focusTopic = ctx.arg.trim()
+
+          try {
+            const result = await requestGateway<SessionCompressResponse>(
+              'session.compress',
+              {
+                session_id: sessionId,
+                ...(focusTopic ? { focus_topic: focusTopic } : {})
+              },
+              SESSION_COMPRESS_TIMEOUT_MS
+            )
+
+            const summary = result?.summary
+
+            if (summary?.headline) {
+              renderSlashOutput(
+                [summary.noop ? summary.headline : `✓ ${summary.headline}`, summary.token_line, summary.note]
+                  .filter(Boolean)
+                  .join('\n')
+              )
+
+              return
+            }
+
+            const removed = result?.removed ?? 0
+            renderSlashOutput(removed > 0 ? `compressed ${removed} messages` : 'nothing to compress')
+          } catch (err) {
+            renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
+          }
         },
         // /yolo maps to the status-bar YOLO control — a per-session approval
         // bypass, same scope as the TUI's Shift+Tab. With no session yet we arm
